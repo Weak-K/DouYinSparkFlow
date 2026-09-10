@@ -311,6 +311,12 @@ class FakeChatInput:
                     if self.editor_structure == "custom"
                     else "\ufeff"
                 )
+                # 生产页面会在同一次发送链路中调用官方 SDK；fake 在 Enter 被门禁
+                # 放行后提交预设回执，供账号级测试验证“清空不等于成功”的新契约。
+                if self.owner_page is not None:
+                    self.owner_page.server_ack_status = (
+                        self.owner_page.next_server_ack_status
+                    )
             if self.owner_page is not None:
                 # 真实 Chromium 即使 keydown 被阻断仍会产生 keyup。fake 显式派发
                 # 全部潜在 Enter 相位，验证预装门禁不会让站点改用 keyup 绕过。
@@ -482,6 +488,10 @@ class FakePage:
         self.enter_gate_status = tasks.ENTER_AUTHORITY_GUARD_DISARMED
         self.enter_phase_events = []
         self.blocked_enter_phases = []
+        self.server_ack_tracker_installed = False
+        self.server_ack_status = tasks.SERVER_ACK_TRACKER_PENDING
+        self.next_server_ack_status = tasks.SERVER_ACK_TRACKER_ACKNOWLEDGED
+        self.server_ack_status_code = ""
         self.lifecycle_events = []
         self.chat_input.owner_page = self
 
@@ -593,6 +603,28 @@ class FakePage:
 
     def evaluate(self, expression, ignored_handle=None):
         self.evaluated_expressions.append(expression)
+        if "installServerAckTracker" in expression:
+            if self.server_ack_tracker_installed:
+                return "SERVER_ACK_TRACKER_SETUP_ERROR"
+            self.server_ack_tracker_installed = True
+            self.server_ack_status = tasks.SERVER_ACK_TRACKER_PENDING
+            return tasks.SERVER_ACK_TRACKER_ARMED
+        if "consumeServerAckTracker" in expression:
+            if not self.server_ack_tracker_installed:
+                return {
+                    "state": tasks.SERVER_ACK_TRACKER_MISSING,
+                    "statusCode": "",
+                }
+            result = {
+                "state": self.server_ack_status,
+                "statusCode": self.server_ack_status_code,
+            }
+            if self.server_ack_status in {
+                tasks.SERVER_ACK_TRACKER_ACKNOWLEDGED,
+                tasks.SERVER_ACK_TRACKER_REJECTED,
+            }:
+                self.server_ack_tracker_installed = False
+            return result
         if "consumeEnterAuthorityGuardStatus" in expression:
             return self.consume_fake_enter_guard_status()
         if "readAuthoritativeConversationSnapshot" in expression:
@@ -2161,7 +2193,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 runtime_config=TEST_CONFIG,
             )
 
-        self.assertEqual(result.state, tasks.TaskState.SUBMITTED_UNCONFIRMED)
+        self.assertEqual(result.state, tasks.TaskState.ACKNOWLEDGED)
         self.assertEqual(result.submitted_targets, ("目标一",))
         self.assertTrue(context.closed)
         self.assertEqual(context.routes[0][0], "**/*")
@@ -2235,7 +2267,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 runtime_config=TEST_CONFIG,
             )
 
-        self.assertEqual(result.state, tasks.TaskState.SUBMITTED_UNCONFIRMED)
+        self.assertEqual(result.state, tasks.TaskState.ACKNOWLEDGED)
         self.assertEqual(
             result.submitted_targets,
             ("配置别名甲", "配置别名乙"),
@@ -2318,7 +2350,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 runtime_config=TEST_CONFIG,
             )
 
-        self.assertEqual(result.state, tasks.TaskState.SUBMITTED_UNCONFIRMED)
+        self.assertEqual(result.state, tasks.TaskState.ACKNOWLEDGED)
         self.assertEqual(result.submitted_targets, ("重选目标",))
         self.assertEqual(select_user.call_count, 2)
         build_message.assert_called_once_with()
@@ -2797,7 +2829,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 runtime_config=TEST_CONFIG,
             )
 
-        self.assertEqual(result.state, tasks.TaskState.SUBMITTED_UNCONFIRMED)
+        self.assertEqual(result.state, tasks.TaskState.ACKNOWLEDGED)
         self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
         self.assertEqual(chat_input.text, "\u200b")
         self.assertTrue(context.closed)
@@ -2872,6 +2904,57 @@ class TaskReliabilityTests(unittest.TestCase):
 
         self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
         self.assertTrue(context.closed)
+
+    def test_editor_clear_without_server_ack_is_failure_and_never_retries(self):
+        """输入框虽清空但 SDK 明确拒绝时，必须失败且不能重复发送。"""
+
+        chat_input = FakeChatInput(clear_after_enter=True)
+        page = FakePage(chat_input=chat_input, right_title="回执拒绝好友")
+        page.next_server_ack_status = tasks.SERVER_ACK_TRACKER_REJECTED
+        page.server_ack_status_code = "7914"
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        item = FakeConversationItem("回执拒绝好友")
+        item.active = True
+        selection = tasks.ConfirmedConversation(
+            "回执拒绝目标",
+            "回执拒绝好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
+
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            return_value=[selection],
+        ), patch.object(tasks, "_build_message", return_value="不会误报成功的消息"):
+            with self.assertRaisesRegex(
+                tasks.SubmissionConfirmationError,
+                "状态码 7914",
+            ):
+                tasks.do_user_task(
+                    browser,
+                    "回执拒绝账号",
+                    [],
+                    ["回执拒绝目标"],
+                    runtime_config={**TEST_CONFIG, "browserTimeout": 1},
+                )
+
+        self.assertEqual(chat_input.text, "\ufeff")
+        self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
+        self.assertTrue(context.closed)
+        tracker_script = next(
+            expression
+            for expression in page.evaluated_expressions
+            if "installServerAckTracker" in expression
+        )
+        # 锁定生产观察器的关键边界：调用必须原样转发，且成功同时依赖 SDK
+        # success 与服务端 ID，不能退化成只看 Promise 完成或输入框清空。
+        self.assertIn("Reflect.apply(originalSendMessage, this, args)", tracker_script)
+        self.assertIn("result.success === true", tracker_script)
+        self.assertIn("message.serverId", tracker_script)
+        self.assertIn("sdk.sendMessage = originalSendMessage", tracker_script)
 
     def test_multiple_editable_nodes_abort_before_message_build(self):
         """页面并存多个可编辑节点时不允许猜测首个节点并输入。"""
@@ -2956,7 +3039,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 raise RuntimeError("账号一页面异常")
             return tasks.TaskResult(
                 username=username,
-                state=tasks.TaskState.SUBMITTED_UNCONFIRMED,
+                state=tasks.TaskState.ACKNOWLEDGED,
                 requested_targets=tuple(targets),
                 submitted_targets=tuple(targets),
             )
@@ -2974,7 +3057,7 @@ class TaskReliabilityTests(unittest.TestCase):
         self.assertTrue(playwright.stopped)
         self.assertEqual(
             [result.state for result in raised.exception.results],
-            [tasks.TaskState.FAILED, tasks.TaskState.SUBMITTED_UNCONFIRMED],
+            [tasks.TaskState.FAILED, tasks.TaskState.ACKNOWLEDGED],
         )
 
     def test_playwright_stops_even_when_browser_close_fails(self):

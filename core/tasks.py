@@ -6,9 +6,9 @@
 
 线上只读探测已经获得会话切换的双重证据：被点击的列表项会增加当前会话类名，
 右侧标题也会变成该列表项的显示名。因此代码在输入前必须同时验证这两项证据，
-任何身份歧义、旧草稿或 DOM 状态不一致都会终止当前账号。页面仍没有可靠的服务端
-送达回执，所以只有 Enter 后编辑器确实清空时才记为“已提交但未确认”，绝不把
-点击、输入或按键本身误报为发送成功。
+任何身份歧义、旧草稿或 DOM 状态不一致都会终止当前账号。发送时还会一次性观察
+页面正在使用的官方 IM SDK：只有 SDK 返回成功且消息获得非空服务端 ID，才把目标
+记为已确认提交；点击、输入、按键或编辑器清空本身都不再被当成发送成功。
 """
 
 from __future__ import annotations
@@ -113,6 +113,14 @@ ENTER_AUTHORITY_GUARD_ARMED = "ENTER_AUTHORITY_GUARD_ARMED"
 ENTER_AUTHORITY_GUARD_ALLOWED = "ENTER_AUTHORITY_GUARD_ALLOWED"
 ENTER_AUTHORITY_GUARD_BLOCKED = "ENTER_AUTHORITY_GUARD_BLOCKED"
 ENTER_AUTHORITY_GUARD_DISARMED = "ENTER_AUTHORITY_GUARD_DISARMED"
+# 发送回执观察器只暴露固定状态和非敏感状态码，不把会话 ID、消息正文或服务端
+# 消息 ID 带回 Python。观察器只接管当前会话的下一次 SDK sendMessage 调用，并在
+# 调用完成后立即恢复原方法，避免影响页面后续自身行为。
+SERVER_ACK_TRACKER_ARMED = "SERVER_ACK_TRACKER_ARMED"
+SERVER_ACK_TRACKER_PENDING = "SERVER_ACK_TRACKER_PENDING"
+SERVER_ACK_TRACKER_ACKNOWLEDGED = "SERVER_ACK_TRACKER_ACKNOWLEDGED"
+SERVER_ACK_TRACKER_REJECTED = "SERVER_ACK_TRACKER_REJECTED"
+SERVER_ACK_TRACKER_MISSING = "SERVER_ACK_TRACKER_MISSING"
 
 
 @dataclass(frozen=True)
@@ -259,13 +267,13 @@ class EditorSafetyError(RuntimeError):
 
 
 class SubmissionConfirmationError(RuntimeError):
-    """Enter 后编辑器没有清空，因而不能记录提交的异常。"""
+    """Enter 后缺少编辑器清空或服务端成功回执时的保守失败异常。"""
 
 
 class TaskState(str, Enum):
     """账号任务的保守终态。"""
 
-    SUBMITTED_UNCONFIRMED = "submitted_unconfirmed"
+    ACKNOWLEDGED = "acknowledged"
     PARTIAL_FAILURE = "partial_failure"
     FAILED = "failed"
 
@@ -283,9 +291,9 @@ class TaskResult:
 
     @property
     def succeeded(self) -> bool:
-        """表示任务流程完整执行；消息本身仍属于未确认状态。"""
+        """只有全部消息均取得服务端成功回执时才表示任务成功。"""
 
-        return self.state == TaskState.SUBMITTED_UNCONFIRMED
+        return self.state == TaskState.ACKNOWLEDGED
 
     @classmethod
     def failed(
@@ -2579,6 +2587,215 @@ def _wait_for_editor_cleared(
     )
 
 
+def _install_server_ack_tracker(
+    page: Any,
+    selection: ConfirmedConversation,
+) -> None:
+    """在输入前为当前权威会话安装一次性官方 IM SDK 回执观察器。
+
+    抖音页面会在编辑器清空之前或之后异步调用官方 SDK 的 ``sendMessage``。仅观察
+    DOM 无法区分服务端接受与本地乐观清空，因此这里包装页面正在使用的同一个 SDK
+    实例方法，原样转发参数、``this``、返回值和异常。包装器只观察权威会话 ID 对应
+    的一次调用，完成后立刻恢复原方法；它不构造消息、不增加请求，也不进行重试。
+    """
+
+    if selection.stable_index is None or selection.authority_proof is None:
+        raise SubmissionConfirmationError("缺少权威会话证明，无法安装服务端回执观察器")
+    conversation_id = selection.authority_proof.ordered_ids[selection.stable_index]
+    try:
+        status = page.evaluate(
+            r"""async (expectedConversationId) => {
+                /* installServerAckTracker */
+                const trackerKey = "__DOUYIN_SPARK_FLOW_SERVER_ACK_V1__";
+                const armed = "SERVER_ACK_TRACKER_ARMED";
+                const pending = "SERVER_ACK_TRACKER_PENDING";
+                const acknowledged = "SERVER_ACK_TRACKER_ACKNOWLEDGED";
+                const rejected = "SERVER_ACK_TRACKER_REJECTED";
+                try {
+                    if (
+                        typeof expectedConversationId !== "string"
+                        || !expectedConversationId
+                        || Object.prototype.hasOwnProperty.call(window, trackerKey)
+                    ) return "SERVER_ACK_TRACKER_SETUP_ERROR";
+
+                    const remoteNames = Object.getOwnPropertyNames(window).filter(
+                        (name) => name.startsWith("__VMOK_@pc-im/im:"),
+                    );
+                    if (remoteNames.length !== 1) {
+                        return "SERVER_ACK_TRACKER_SETUP_ERROR";
+                    }
+                    const remote = window[remoteNames[0]];
+                    if (!remote || typeof remote.get !== "function") {
+                        return "SERVER_ACK_TRACKER_SETUP_ERROR";
+                    }
+                    const factory = await remote.get(".");
+                    if (typeof factory !== "function") {
+                        return "SERVER_ACK_TRACKER_SETUP_ERROR";
+                    }
+                    const exportsObject = factory();
+                    const manager = exportsObject
+                        && exportsObject.Context
+                        && exportsObject.Context.instance
+                        && exportsObject.Context.instance.imSdkService
+                        && exportsObject.Context.instance.imSdkService.imSdkManager;
+                    const sdk = manager
+                        && typeof manager.getImSdkInstance === "function"
+                        && manager.getImSdkInstance();
+                    if (!sdk || typeof sdk.sendMessage !== "function") {
+                        return "SERVER_ACK_TRACKER_SETUP_ERROR";
+                    }
+
+                    const originalSendMessage = sdk.sendMessage;
+                    const tracker = {
+                        sdk,
+                        originalSendMessage,
+                        wrapper: null,
+                        state: pending,
+                        statusCode: "",
+                    };
+                    const wrapper = async function (...args) {
+                        const message = args[0] && args[0].message;
+                        if (
+                            !message
+                            || String(message.conversationId || "")
+                                !== expectedConversationId
+                        ) {
+                            return Reflect.apply(originalSendMessage, this, args);
+                        }
+                        try {
+                            const result = await Reflect.apply(
+                                originalSendMessage,
+                                this,
+                                args,
+                            );
+                            const serverId = message.serverId;
+                            const normalizedServerId = serverId == null
+                                ? ""
+                                : String(serverId);
+                            tracker.statusCode = result && result.statusCode != null
+                                ? String(result.statusCode)
+                                : "";
+                            tracker.state = (
+                                result
+                                && result.success === true
+                                && normalizedServerId
+                                && normalizedServerId !== "0"
+                            ) ? acknowledged : rejected;
+                            return result;
+                        } catch (error) {
+                            tracker.state = rejected;
+                            throw error;
+                        } finally {
+                            if (sdk.sendMessage === wrapper) {
+                                sdk.sendMessage = originalSendMessage;
+                            }
+                        }
+                    };
+                    tracker.wrapper = wrapper;
+                    Object.defineProperty(window, trackerKey, {
+                        value: tracker,
+                        configurable: true,
+                        enumerable: false,
+                        writable: false,
+                    });
+                    sdk.sendMessage = wrapper;
+                    if (sdk.sendMessage !== wrapper) {
+                        delete window[trackerKey];
+                        return "SERVER_ACK_TRACKER_SETUP_ERROR";
+                    }
+                    return armed;
+                } catch (_ignored) {
+                    return "SERVER_ACK_TRACKER_SETUP_ERROR";
+                }
+            }""",
+            conversation_id,
+        )
+    except Exception:
+        raise SubmissionConfirmationError(
+            "安装抖音服务端回执观察器失败，已在输入前终止"
+        ) from None
+    if status != SERVER_ACK_TRACKER_ARMED:
+        raise SubmissionConfirmationError(
+            "抖音服务端回执观察器未能安全就绪，已在输入前终止"
+        )
+
+
+def _consume_server_ack_tracker(page: Any) -> Mapping[str, str]:
+    """读取回执状态；终态会同时恢复 SDK 原方法并删除页面观察器。"""
+
+    try:
+        result = page.evaluate(
+            r"""() => {
+                /* consumeServerAckTracker */
+                const trackerKey = "__DOUYIN_SPARK_FLOW_SERVER_ACK_V1__";
+                const tracker = window[trackerKey];
+                if (!tracker) {
+                    return {
+                        state: "SERVER_ACK_TRACKER_MISSING",
+                        statusCode: "",
+                    };
+                }
+                const terminal = (
+                    tracker.state === "SERVER_ACK_TRACKER_ACKNOWLEDGED"
+                    || tracker.state === "SERVER_ACK_TRACKER_REJECTED"
+                );
+                const result = {
+                    state: String(tracker.state || ""),
+                    statusCode: String(tracker.statusCode || ""),
+                };
+                if (terminal) {
+                    if (tracker.sdk.sendMessage === tracker.wrapper) {
+                        tracker.sdk.sendMessage = tracker.originalSendMessage;
+                    }
+                    delete window[trackerKey];
+                }
+                return result;
+            }"""
+        )
+    except Exception:
+        raise SubmissionConfirmationError(
+            "读取抖音服务端发送回执失败，提交状态不可信"
+        ) from None
+    if (
+        not isinstance(result, Mapping)
+        or not isinstance(result.get("state"), str)
+        or not isinstance(result.get("statusCode"), str)
+    ):
+        raise SubmissionConfirmationError("抖音服务端发送回执结构无效")
+    return result
+
+
+def _wait_for_server_acknowledgement(page: Any, timeout_ms: int) -> None:
+    """等待官方 IM SDK 明确返回成功并分配服务端消息 ID。
+
+    Enter 可能已经到达服务端，所以无回执、拒绝、协议异常和超时都只能失败关闭，
+    不能再次按 Enter。状态码只用于诊断，不包含账号、会话或消息内容。
+    """
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        result = _consume_server_ack_tracker(page)
+        state = result["state"]
+        if state == SERVER_ACK_TRACKER_ACKNOWLEDGED:
+            return
+        if state == SERVER_ACK_TRACKER_REJECTED:
+            status_code = result["statusCode"]
+            detail = f"（状态码 {status_code}）" if status_code else ""
+            raise SubmissionConfirmationError(
+                f"抖音服务端拒绝发送{detail}，不会自动重试 Enter"
+            )
+        if state == SERVER_ACK_TRACKER_MISSING:
+            raise SubmissionConfirmationError("抖音服务端回执观察器意外丢失")
+        if state not in {SERVER_ACK_TRACKER_ARMED, SERVER_ACK_TRACKER_PENDING}:
+            raise SubmissionConfirmationError("抖音服务端发送回执状态无效")
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise SubmissionConfirmationError(
+                "抖音服务端发送回执超时，提交状态不可信且不会重试 Enter"
+            )
+        _wait_for_page(page, min(DOM_CONFIRM_POLL_INTERVAL_MS, remaining_ms))
+
+
 def _build_message() -> str:
     """延迟导入消息构建器，避免纯配置与选择器测试加载网络依赖。"""
 
@@ -2803,6 +3020,10 @@ def do_user_task(
                 for target in selection.covered_targets:
                     pending_targets.remove(target)
                 continue
+            # 回执观察器必须在输入和 Enter 之前安装：这样站点即使在 keydown 同一
+            # 事件中立即进入 SDK，也不会错过本次调用。安装失败发生在零输入边界，
+            # 因而可以安全终止；安装成功后任何异常都不允许重按 Enter。
+            _install_server_ack_tracker(page, selection)
             _type_multiline_message(chat_input, message)
 
             # 输入过程也可能触发页面状态变化。在执行具有外部副作用且不可重试的
@@ -2848,6 +3069,10 @@ def do_user_task(
                 chat_input,
                 task_config["browserTimeout"],
             )
+            _wait_for_server_acknowledgement(
+                page,
+                task_config["browserTimeout"],
+            )
             # 一个已确认会话可能覆盖同一 FriendIdentity 的多个配置别名，但消息只
             # 按一次 Enter。清空证据成立后再把整组别名计入提交结果，防止别名组
             # 被误判为部分缺失并在后续循环对同一好友重复发送。
@@ -2859,8 +3084,7 @@ def do_user_task(
                 pending_targets.remove(target)
                 pre_input_reselection_counts.pop(target, None)
             logger.info(
-                "一个目标会话已确认且 Enter 后编辑器已清空：覆盖配置标识数=%s，"
-                "记为已提交但未确认送达",
+                "一个目标会话已确认且抖音服务端已接受：覆盖配置标识数=%s",
                 len(selection.covered_targets),
             )
 
@@ -2883,7 +3107,7 @@ def do_user_task(
 
         return TaskResult(
             username=username,
-            state=TaskState.SUBMITTED_UNCONFIRMED,
+            state=TaskState.ACKNOWLEDGED,
             requested_targets=requested_targets,
             submitted_targets=tuple(submitted_targets),
         )
@@ -2964,5 +3188,5 @@ def runTasks(
     if any(not result.succeeded for result in results):
         raise TaskBatchError(results)
 
-    logger.info("全部账号已完成提交；发送结果保持未确认状态")
+    logger.info("全部账号消息均已取得抖音服务端成功回执")
     return results
