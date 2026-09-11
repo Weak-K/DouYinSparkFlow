@@ -2954,7 +2954,9 @@ class TaskReliabilityTests(unittest.TestCase):
         self.assertIn("Reflect.apply(originalSendMessage, this, args)", tracker_script)
         self.assertIn("result.success === true", tracker_script)
         self.assertIn("message.serverId", tracker_script)
-        self.assertIn("sdk.sendMessage = originalSendMessage", tracker_script)
+        self.assertIn("sendMessageOwner", tracker_script)
+        self.assertIn("Object.defineProperty(sendMessageOwner, \"sendMessage\"", tracker_script)
+        self.assertIn("originalSendMessageDescriptor", tracker_script)
 
     def test_multiple_editable_nodes_abort_before_message_build(self):
         """页面并存多个可编辑节点时不允许猜测首个节点并输入。"""

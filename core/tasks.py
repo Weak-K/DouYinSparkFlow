@@ -2645,9 +2645,36 @@ def _install_server_ack_tracker(
                         return "SERVER_ACK_TRACKER_SETUP_ERROR";
                     }
 
-                    const originalSendMessage = sdk.sendMessage;
+                    // 当前抖音 SDK 实例在生产环境是 sealed，不能给实例本身新增
+                    // sendMessage 属性；真实方法位于可写、可配置的原型链上。必须
+                    // 精确找到该属性拥有者后替换其 descriptor，不能猜测或解封实例。
+                    let sendMessageOwner = sdk;
+                    let originalSendMessageDescriptor = null;
+                    for (let level = 0; sendMessageOwner && level < 8; level += 1) {
+                        const descriptor = Object.getOwnPropertyDescriptor(
+                            sendMessageOwner,
+                            "sendMessage",
+                        );
+                        if (descriptor) {
+                            originalSendMessageDescriptor = descriptor;
+                            break;
+                        }
+                        sendMessageOwner = Object.getPrototypeOf(sendMessageOwner);
+                    }
+                    if (
+                        !sendMessageOwner
+                        || !originalSendMessageDescriptor
+                        || typeof originalSendMessageDescriptor.value !== "function"
+                        || !originalSendMessageDescriptor.writable
+                        || !originalSendMessageDescriptor.configurable
+                    ) {
+                        return "SERVER_ACK_TRACKER_SETUP_ERROR";
+                    }
+                    const originalSendMessage = originalSendMessageDescriptor.value;
                     const tracker = {
                         sdk,
+                        sendMessageOwner,
+                        originalSendMessageDescriptor,
                         originalSendMessage,
                         wrapper: null,
                         state: pending,
@@ -2686,8 +2713,12 @@ def _install_server_ack_tracker(
                             tracker.state = rejected;
                             throw error;
                         } finally {
-                            if (sdk.sendMessage === wrapper) {
-                                sdk.sendMessage = originalSendMessage;
+                            if (sendMessageOwner.sendMessage === wrapper) {
+                                Object.defineProperty(
+                                    sendMessageOwner,
+                                    "sendMessage",
+                                    originalSendMessageDescriptor,
+                                );
                             }
                         }
                     };
@@ -2698,8 +2729,16 @@ def _install_server_ack_tracker(
                         enumerable: false,
                         writable: false,
                     });
-                    sdk.sendMessage = wrapper;
-                    if (sdk.sendMessage !== wrapper) {
+                    Object.defineProperty(sendMessageOwner, "sendMessage", {
+                        ...originalSendMessageDescriptor,
+                        value: wrapper,
+                    });
+                    if (sendMessageOwner.sendMessage !== wrapper) {
+                        Object.defineProperty(
+                            sendMessageOwner,
+                            "sendMessage",
+                            originalSendMessageDescriptor,
+                        );
                         delete window[trackerKey];
                         return "SERVER_ACK_TRACKER_SETUP_ERROR";
                     }
@@ -2744,8 +2783,12 @@ def _consume_server_ack_tracker(page: Any) -> Mapping[str, str]:
                     statusCode: String(tracker.statusCode || ""),
                 };
                 if (terminal) {
-                    if (tracker.sdk.sendMessage === tracker.wrapper) {
-                        tracker.sdk.sendMessage = tracker.originalSendMessage;
+                    if (tracker.sendMessageOwner.sendMessage === tracker.wrapper) {
+                        Object.defineProperty(
+                            tracker.sendMessageOwner,
+                            "sendMessage",
+                            tracker.originalSendMessageDescriptor,
+                        );
                     }
                     delete window[trackerKey];
                 }
