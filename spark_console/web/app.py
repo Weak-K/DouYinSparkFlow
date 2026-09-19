@@ -423,7 +423,7 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
                     user=user,
                     csrf_token=record.csrf_token,
                     is_admin=user.role == "admin",
-                    error="新密码至少需要 12 位",
+                    error="新密码至少需要 6 位",
                 )
             user.must_change_password = False
         return RedirectResponse("/dashboard", status_code=303)

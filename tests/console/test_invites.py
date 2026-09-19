@@ -101,9 +101,14 @@ class InviteServiceTests(unittest.TestCase):
 
 
 class RegistrationPasswordTests(unittest.TestCase):
-    def test_registration_password_requires_ten_characters_letters_and_digits(self):
-        validate_registration_password("StrongPass1")
-        for password in ("Short1234", "abcdefghij", "1234567890"):
+    def test_registration_password_only_requires_six_characters(self):
+        # 内部小工具：只要 6 位即可，不再要求字母 + 数字混合。
+        for password in ("StrongPass1", "123456", "abcdef", "aB3!xy"):
+            with self.subTest(password=password):
+                validate_registration_password(password)
+
+    def test_registration_password_rejects_fewer_than_six_characters(self):
+        for password in ("12345", "abcde", ""):
             with self.subTest(password=password):
                 with self.assertRaisesRegex(ValidationError, "注册信息或邀请码无效"):
                     validate_registration_password(password)

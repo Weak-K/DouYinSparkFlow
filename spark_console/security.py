@@ -10,13 +10,20 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from spark_console.models import WebSession
 
 
+# 密码最短长度：内部小工具，按用户要求从 10/12 位放宽到 6 位
+# （不再强制字母 + 数字混合，纯数字也接受）。
+MIN_PASSWORD_LENGTH = 6
+
+
 class PasswordService:
     def __init__(self) -> None:
         self._hasher = PasswordHasher()
 
     def hash(self, password: str) -> str:
-        if len(password) < 12:
-            raise ValueError("password must contain at least 12 characters")
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"password must contain at least {MIN_PASSWORD_LENGTH} characters"
+            )
         return self._hasher.hash(password)
 
     def verify(self, encoded: str, password: str) -> bool:

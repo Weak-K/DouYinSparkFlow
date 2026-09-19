@@ -118,6 +118,51 @@ class UserWebTests(unittest.TestCase):
             },
         )
 
+    def test_password_change_accepts_a_six_character_password(self):
+        self.login()
+        page = self.client.get("/change-password")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+        response = self.client.post(
+            "/change-password",
+            data={
+                "csrf_token": csrf,
+                "current_password": "Temporary-123!",
+                "new_password": "abc123",
+                "new_password_confirmation": "abc123",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/dashboard", response.headers["location"])
+        with session_scope(self.engine) as session:
+            user = session.scalar(select(User).where(User.username == "friend"))
+            self.assertFalse(user.must_change_password)
+            self.assertTrue(PasswordService().verify(user.password_hash, "abc123"))
+
+    def test_password_change_rejects_five_characters(self):
+        self.login()
+        page = self.client.get("/change-password")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+        response = self.client.post(
+            "/change-password",
+            data={
+                "csrf_token": csrf,
+                "current_password": "Temporary-123!",
+                "new_password": "abc12",
+                "new_password_confirmation": "abc12",
+            },
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("新密码至少需要 6 位", response.text)
+        with session_scope(self.engine) as session:
+            user = session.scalar(select(User).where(User.username == "friend"))
+            self.assertTrue(user.must_change_password)
+            self.assertTrue(PasswordService().verify(user.password_hash, "Temporary-123!"))
+
     def test_user_can_save_the_cookie_alert_email(self):
         self.complete_first_login()
         accounts = self.client.get("/accounts")

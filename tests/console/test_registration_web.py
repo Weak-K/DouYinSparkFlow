@@ -240,7 +240,32 @@ class RegistrationWebTests(unittest.TestCase):
         response = self.client.get("/register")
 
         self.assertIn("3–32 位字母、数字、下划线或短横线", response.text)
-        self.assertIn("至少 10 位，并同时包含字母和数字", response.text)
+        self.assertIn("至少 6 位", response.text)
+
+    def test_six_character_password_is_accepted_at_registration(self):
+        response = self.client.post(
+            "/register",
+            data=self.registration_data(password="123456", password_confirmation="123456"),
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        with Session(self.engine) as session:
+            user = session.scalar(select(User).where(User.username == "newfriend"))
+            self.assertIsNotNone(user)
+            self.assertTrue(PasswordService().verify(user.password_hash, "123456"))
+
+    def test_password_shorter_than_six_characters_is_rejected(self):
+        response = self.client.post(
+            "/register",
+            data=self.registration_data(password="12345", password_confirmation="12345"),
+            follow_redirects=False,
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn(PUBLIC_ERROR, response.text)
+        with Session(self.engine) as session:
+            self.assertIsNone(session.scalar(select(User).where(User.username == "newfriend")))
 
     def test_register_page_collects_a_required_notification_email(self):
         response = self.client.get("/register")

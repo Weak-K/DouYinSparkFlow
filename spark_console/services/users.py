@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from spark_console.models import DouyinAccount, SparkTask, User, WebSession
-from spark_console.security import PasswordService
+from spark_console.security import MIN_PASSWORD_LENGTH, PasswordService
 from spark_console.services import Conflict, NotFound, ValidationError
 from spark_console.services.audits import AuditService
 
@@ -35,11 +35,8 @@ def normalize_email(raw: str, *, required: bool = False) -> str | None:
 
 
 def validate_registration_password(password: str) -> None:
-    if (
-        len(password) < 10
-        or not any(character.isalpha() for character in password)
-        or not any(character.isdigit() for character in password)
-    ):
+    # 只要满足最短长度即可，不强制字母 + 数字混合（见 MIN_PASSWORD_LENGTH）。
+    if len(password) < MIN_PASSWORD_LENGTH:
         raise ValidationError("注册信息或邀请码无效")
 
 
