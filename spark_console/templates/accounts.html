@@ -32,13 +32,14 @@
       {% for account in accounts %}
       <article class="item account-item">
         <div class="account-summary">
-          <strong>{{ account.display_name }}</strong>
+          {# 账号名不再重复显示 —— 右侧那个可编辑框里已经是名字本身，
+             这里只留验证状态，避免同一行出现两遍。 #}
           <p class="muted">验证状态：{{ account.validation_state }}</p>
         </div>
         <div class="account-controls">
           <form method="post" action="/accounts/{{ account.id }}/rename" class="account-rename">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <label class="sr-only" for="account-name-{{ account.id }}">新账号备注</label>
+            <label class="sr-only" for="account-name-{{ account.id }}">账号备注</label>
             <input id="account-name-{{ account.id }}" name="display_name" value="{{ account.display_name }}" maxlength="64" required>
             <button class="quiet" type="submit">修改备注</button>
           </form>

@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(required=True)
     admin = commands.add_parser("create-admin"); admin.add_argument("username"); admin.add_argument("--email", default=None, help="Cookie 失效提醒邮箱（可在控制台里补填）"); admin.set_defaults(handler=command_create_admin)
     user = commands.add_parser("create-user"); user.add_argument("username"); user.add_argument("--email", default=None, help="Cookie 失效提醒邮箱（可在控制台里补填）"); user.set_defaults(handler=command_create_user)
-    legacy = commands.add_parser("import-legacy"); legacy.add_argument("path"); legacy.add_argument("--owner", required=True); legacy.add_argument("--time", default="09:00"); legacy.add_argument("--message", default="今日火花"); legacy.set_defaults(handler=command_import_legacy)
+    legacy = commands.add_parser("import-legacy"); legacy.add_argument("path"); legacy.add_argument("--owner", required=True); legacy.add_argument("--time", default="09:00"); legacy.add_argument("--message", default="[盖瑞]今日火花[加一]"); legacy.set_defaults(handler=command_import_legacy)
     backup = commands.add_parser("backup-db"); backup.set_defaults(handler=command_backup)
     return parser
 

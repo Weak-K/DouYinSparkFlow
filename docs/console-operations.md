@@ -128,24 +128,28 @@ docker compose -f compose.console.yml ps
 
 ## Cookie 失效提醒邮件
 
-每个控制台账号在注册时必须填写**自己的通知邮箱**（`users.email`）。账号下绑定的抖音号各不相同，所以提醒邮件只发给该抖音号所属的用户本人，不存在全局收件人。
+每个控制台账号在注册时必须填写**自己的通知邮箱**（`users.email`）。账号下绑定的抖音号各不相同，所以提醒邮件只发给该抖音号所属的用户本人，不存在全局群发。
 
 - 触发点：Worker 执行任务时，抖音号返回 `cookie_invalid`，账号状态由「正常」变为「需要重新登录」。再次执行时不会重复发送，避免每天轰炸。
-- 收件人为空（管理员建号时未填、用户自己也没补）时跳过发送，只在日志留一条 warning。
-- SMTP 未配置时同样跳过发送，绝不影响任务执行与重试。
+- 兜底：该抖音号所属用户尚未填写邮箱（例如 `import-legacy` 导入的旧账号）时，改发给 `SPARK_ALERT_EMAIL_TO`，不会静默丢提醒。
+- SMTP 未配置时跳过发送，且绝不影响任务执行与重试。
 
-在 `.env.console` 中填写发件邮箱（以 QQ 邮箱为例，授权码不是登录密码）：
+同一套 SMTP 还承担**其他任务失败的全局告警**（`alert_task_failure`）：任何非 `cookie_invalid` 的失败都会在**冷却窗口**（`SPARK_ALERT_COOLDOWN_MINUTES`，默认 60 分钟）内最多发一封给 `SPARK_ALERT_EMAIL_TO`，其余只计入「已抑制」，窗口过后下一封会带上被抑制的条数。`cookie_invalid` 不进这条路径——它已经按用户发给本人，不再重复。
+
+在 `.env.console` 中填写发件邮箱（以 163 邮箱为例，授权码不是登录密码）：
 
 ```bash
-SPARK_SMTP_HOST=smtp.qq.com
+SPARK_SMTP_HOST=smtp.163.com
 SPARK_SMTP_PORT=465
 SPARK_SMTP_SECURITY=ssl
-SPARK_SMTP_USER=发件邮箱@qq.com
+SPARK_SMTP_USER=发件邮箱@163.com
 SPARK_SMTP_PASSWORD=邮箱授权码
 SPARK_SMTP_FROM=
+SPARK_ALERT_EMAIL_TO=运维收件人@qq.com
+SPARK_ALERT_COOLDOWN_MINUTES=60
 ```
 
-`SPARK_SMTP_SECURITY` 可选 `ssl`（465）、`starttls`（587）、`plain`；`SPARK_SMTP_FROM` 留空时用 `SPARK_SMTP_USER`。
+`SPARK_SMTP_SECURITY` 可选 `ssl`（465）、`starttls`（587）、`plain`；`SPARK_SMTP_FROM` 留空时用 `SPARK_SMTP_USER`。冷却状态写在 `$SPARK_DATA_DIR/alert-state.json`（容器内 `/data`，随数据卷持久化）。
 
 改完只重启 Worker 即可，不需要重建镜像：
 
@@ -154,7 +158,20 @@ docker compose --env-file .env.console -f compose.console.yml up -d --force-recr
 docker compose --env-file .env.console -f compose.console.yml logs --tail=50 spark-worker
 ```
 
-用户可在控制台「抖音账号」页随时改自己的通知邮箱；管理后台的用户列表会显示每人当前邮箱，未填写时显示「未填写」。排查发信问题时可临时把 `SPARK_SMTP_HOST` 指向本机调试 SMTP，日志只记录“已发送/未配置/发送失败”，不记录收件人与正文。
+用户可在控制台「抖音账号」页随时改自己的通知邮箱；管理后台的用户列表会显示每人当前邮箱，未填写时显示「未填写」。排查发信问题时可在容器里直接跑一次连通性测试（会把测试信发给 `SPARK_ALERT_EMAIL_TO`）：
+
+```bash
+docker compose --env-file .env.console -f compose.console.yml run --rm spark-worker \
+  python -c "import os; from spark_console.notify import MailSettings, send_mail; s = MailSettings.from_environ(os.environ); print('configured:', s.configured, 'recipients:', len(s.alert_recipients)); print('sent:', send_mail(s, s.alert_recipients, '【火花控制台】邮件通道测试', '连通性测试'))"
+```
+
+**在容器里跑测试时必须先清掉 SMTP 环境变量**，否则测试构造的失败记录会真的触发告警邮件：
+
+```bash
+docker compose --env-file .env.console -f compose.console.yml run --rm \
+  -e SPARK_SMTP_USER= -e SPARK_SMTP_PASSWORD= -e SPARK_ALERT_EMAIL_TO= \
+  spark-web python -m unittest discover -s tests/console -t tests/console -p "test_*.py"
+```
 
 ## 备份与回滚
 

@@ -1,30 +1,63 @@
-"""Cookie 失效等事件的邮件通知。
+"""控制台告警邮件：Cookie 失效与任务失败通知。
 
-只使用标准库 smtplib/email，不引入额外依赖。SMTP 未配置时静默跳过，
-发送失败也只记录日志，绝不影响任务执行。
+只使用标准库 smtplib/email，不引入额外依赖。SMTP 未配置时**静默跳过**，
+发送失败也只记一条日志，绝不影响任务执行与重试。
 
-收件人是抖音号所属用户自己的通知邮箱（users.email），不是全局收件人：
-每个控制台用户名下绑定的抖音号不同，Cookie 失效时只提醒该用户本人。
+两个入口，职责分开，互不重复：
+
+- `notify_cookie_expired()`：某个抖音号 Cookie 失效时，**只通知该号所属用户本人**
+  （收件人取 `users.email`）。每个控制台账号名下的抖音号不同，所以不做全局群发；
+  该用户尚未填写邮箱时，兜底发给 `SPARK_ALERT_EMAIL_TO`，避免旧账号静默漏提醒。
+- `alert_task_failure()`：其他任务失败时通知运维收件人，带**冷却窗口**（默认 60 分钟）
+  且在**守护线程**里发送，不阻塞调用方事务；`cookie_invalid` 不走这条路。
+
+环境变量（写在 .env.console）
+    SPARK_SMTP_HOST / _PORT / _SECURITY / _USER / _PASSWORD / _FROM
+    SPARK_ALERT_EMAIL_TO          全局兜底收件人，多个用逗号分隔
+    SPARK_ALERT_COOLDOWN_MINUTES  全局告警最小间隔（默认 60）
+    SPARK_DATA_DIR                冷却状态文件所在目录（默认 /data）
 """
 
 from __future__ import annotations
 
 import html
+import json
 import logging
+import os
 import smtplib
 import socket
+import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate
-from typing import Mapping
+from pathlib import Path
+from typing import Mapping, Sequence
 
 logger = logging.getLogger("spark.notify")
 
 DEFAULT_SMTP_HOST = "smtp.qq.com"
 DEFAULT_SMTP_PORT = 465
-SMTP_TIMEOUT_SECONDS = 15
-_SUPPORTED_SECURITY = {"ssl", "starttls", "plain"}
+SMTP_TIMEOUT_SECONDS = 20
+DEFAULT_COOLDOWN_MINUTES = 60
+STATE_FILENAME = "alert-state.json"
+SUPPORTED_SECURITY = {"ssl", "starttls", "plain"}
+CONSOLE_URL = "https://lgnsl.com/spark/"
+
+# 这些错误码通常意味着账号未登录 / Cookie 失效，全局邮件里给出对应提示
+COOKIE_RELATED_CODES = {"cookie_invalid", "conversation_not_opened", "target_not_found"}
+
+# 已由「按用户」的失效提醒覆盖，全局告警不再重复发
+USER_SCOPED_CODES = {"cookie_invalid"}
+
+
+def parse_recipients(raw: str) -> tuple[str, ...]:
+    return tuple(
+        address.strip()
+        for address in (raw or "").replace(";", ",").split(",")
+        if address.strip()
+    )
 
 
 @dataclass(frozen=True)
@@ -36,24 +69,34 @@ class MailSettings:
     sender: str = ""
     security: str = "ssl"
     timeout: int = SMTP_TIMEOUT_SECONDS
+    alert_recipients: tuple[str, ...] = ()
+    cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES
+    data_dir: str = "/data"
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> "MailSettings":
         username = environ.get("SPARK_SMTP_USER", "").strip()
         security = environ.get("SPARK_SMTP_SECURITY", "ssl").strip().lower()
-        if security not in _SUPPORTED_SECURITY:
+        if security not in SUPPORTED_SECURITY:
             security = "ssl"
         try:
             port = int(environ.get("SPARK_SMTP_PORT", str(DEFAULT_SMTP_PORT)))
         except ValueError:
             port = DEFAULT_SMTP_PORT
+        try:
+            cooldown = max(1, int(environ.get("SPARK_ALERT_COOLDOWN_MINUTES", "")))
+        except ValueError:
+            cooldown = DEFAULT_COOLDOWN_MINUTES
         return cls(
-            host=environ.get("SPARK_SMTP_HOST", DEFAULT_SMTP_HOST).strip(),
+            host=environ.get("SPARK_SMTP_HOST", "").strip() or DEFAULT_SMTP_HOST,
             port=port,
             username=username,
             password=environ.get("SPARK_SMTP_PASSWORD", ""),
             sender=environ.get("SPARK_SMTP_FROM", "").strip() or username,
             security=security,
+            alert_recipients=parse_recipients(environ.get("SPARK_ALERT_EMAIL_TO", "")),
+            cooldown_minutes=cooldown,
+            data_dir=environ.get("SPARK_DATA_DIR", "").strip() or "/data",
         )
 
     @property
@@ -61,11 +104,27 @@ class MailSettings:
         return bool(self.host and self.username and self.password and self.sender)
 
 
-def send_mail(settings: MailSettings, recipient: str, subject: str, body: str) -> bool:
-    """给单个收件人发送纯文本 + HTML 邮件，返回是否发送成功。不抛出异常。"""
+def _footnote() -> str:
+    return (
+        "---\n"
+        f"控制台：{CONSOLE_URL}\n"
+        f"发送主机：{socket.gethostname()}\n"
+        "此邮件由「抖音火花控制台」自动发送，请勿回复。"
+    )
 
-    if not recipient:
-        logger.warning("通知邮箱为空，跳过邮件发送")
+
+def send_mail(
+    settings: MailSettings,
+    recipients: str | Sequence[str],
+    subject: str,
+    body: str,
+) -> bool:
+    """同步发送一封纯文本 + HTML 邮件，返回是否发送成功。不抛出异常。"""
+
+    targets = [recipients] if isinstance(recipients, str) else list(recipients)
+    targets = [address for address in targets if address]
+    if not targets:
+        logger.warning("收件人为空，跳过邮件发送")
         return False
     if not settings.configured:
         logger.warning("邮件通知未配置（SPARK_SMTP_USER/SPARK_SMTP_PASSWORD 缺失），跳过发送")
@@ -73,40 +132,37 @@ def send_mail(settings: MailSettings, recipient: str, subject: str, body: str) -
 
     message = MIMEMultipart("alternative")
     message["From"] = settings.sender
-    message["To"] = recipient
+    message["To"] = ", ".join(targets)
     message["Subject"] = subject
     message["Date"] = formatdate(localtime=True)
-    hostname = socket.gethostname()
 
-    text_body = (
-        f"{body}\n\n"
-        "---\n"
-        f"发送主机：{hostname}\n"
-        "此邮件由火花守护控制台自动发送，请勿回复。"
-    )
+    text_body = f"{body}\n\n{_footnote()}"
     html_body = (
         "<html><body>"
         f"<pre style='font-family:monospace;white-space:pre-wrap;'>{html.escape(body)}</pre>"
-        "<hr><p style='color:#888;font-size:12px;'>"
-        f"发送主机：{html.escape(hostname)}<br>此邮件由火花守护控制台自动发送，请勿回复。"
-        "</p></body></html>"
+        f"<hr><p style='color:#888;font-size:12px;'>{html.escape(_footnote())}</p>"
+        "</body></html>"
     )
     message.attach(MIMEText(text_body, "plain", "utf-8"))
     message.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
         if settings.security == "ssl":
-            with smtplib.SMTP_SSL(settings.host, settings.port, timeout=settings.timeout) as server:
+            with smtplib.SMTP_SSL(
+                settings.host, settings.port, timeout=settings.timeout
+            ) as server:
                 server.login(settings.username, settings.password)
-                server.sendmail(settings.sender, [recipient], message.as_string())
+                server.sendmail(settings.sender, targets, message.as_string())
         else:
-            with smtplib.SMTP(settings.host, settings.port, timeout=settings.timeout) as server:
+            with smtplib.SMTP(
+                settings.host, settings.port, timeout=settings.timeout
+            ) as server:
                 if settings.security == "starttls":
                     server.starttls()
                 server.login(settings.username, settings.password)
-                server.sendmail(settings.sender, [recipient], message.as_string())
+                server.sendmail(settings.sender, targets, message.as_string())
     except Exception:
-        logger.exception("通知邮件发送失败")
+        logger.warning("通知邮件发送失败（不影响任务）")
         return False
     logger.info("通知邮件已发送（收件人已隐去）")
     return True
@@ -114,23 +170,140 @@ def send_mail(settings: MailSettings, recipient: str, subject: str, body: str) -
 
 def notify_cookie_expired(
     settings: MailSettings,
-    recipient: str,
+    recipient: str | None,
     *,
     owner_username: str,
     account_name: str,
     occurred_at: str,
     detail: str = "",
 ) -> bool:
-    """某个抖音号 Cookie 失效时，通知该号所属用户。"""
+    """某个抖音号 Cookie 失效：通知该号所属用户本人，没填邮箱时兜底给运维收件人。"""
 
-    subject = f"[火花守护] 抖音号「{account_name}」Cookie 已失效"
+    fallback = not recipient
+    targets: list[str] = list(settings.alert_recipients) if fallback else [recipient]
+    if not targets:
+        logger.warning("该用户未填写通知邮箱且未配置兜底收件人，跳过发送")
+        return False
+
+    subject = f"【火花控制台】抖音号「{account_name}」Cookie 已失效"
     body = (
         f"控制台账号：{owner_username}\n"
         f"抖音号：{account_name}\n"
-        f"状态：Cookie 已失效，该号下的续火任务将无法发送消息。\n"
+        "状态：Cookie 已失效，该号下的续火任务将无法发送消息。\n"
         f"时间：{occurred_at}\n"
-        "\n请在控制台「抖音账号」页面重新扫码绑定该号，并确认页面上填写的通知邮箱可以收到本邮件。\n"
+        "\n请登录控制台，在「抖音账号」页面重新扫码绑定该号。\n"
     )
+    if fallback:
+        body += "\n（该抖音号所属用户尚未填写通知邮箱，本邮件改发给运维收件人。）\n"
     if detail:
         body += f"\n详情：{detail}\n"
-    return send_mail(settings, recipient, subject, body)
+    return send_mail(settings, targets, subject, body)
+
+
+def _state_path(settings: MailSettings) -> Path:
+    return Path(settings.data_dir) / STATE_FILENAME
+
+
+def _read_state(settings: MailSettings) -> dict:
+    try:
+        return json.loads(_state_path(settings).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_state(settings: MailSettings, state: dict) -> None:
+    path = _state_path(settings)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        logger.warning("告警冷却状态写入失败（不影响任务）")
+
+
+def _build_failure_body(
+    stage: str, error_code: str, error_summary: str, suppressed: int
+) -> str:
+    lines = [
+        "抖音火花控制台：任务执行失败",
+        "",
+        f"时间：{datetime.now(timezone.utc).astimezone():%Y-%m-%d %H:%M:%S %Z}",
+        f"阶段：{stage or '未知'}",
+        f"错误码：{error_code or '未提供'}",
+        f"摘要：{error_summary or '无'}",
+    ]
+    if error_code in COOKIE_RELATED_CODES:
+        lines += [
+            "",
+            "这通常意味着该账号未登录或 Cookie 已失效。",
+            "请登录控制台，在「抖音账号」页面重新扫码绑定。",
+        ]
+    if suppressed:
+        lines += ["", f"（本次冷却窗口内另有 {suppressed} 条同类失败告警已被抑制）"]
+    return "\n".join(lines)
+
+
+def _send_async(
+    settings: MailSettings, recipients: Sequence[str], subject: str, body: str
+) -> None:
+    threading.Thread(
+        target=send_mail,
+        args=(settings, list(recipients), subject, body),
+        name="alert-mail",
+        daemon=True,
+    ).start()
+
+
+def alert_task_failure(
+    stage: str = "",
+    error_code: str = "",
+    error_summary: str = "",
+    settings: MailSettings | None = None,
+) -> bool:
+    """任务失败的全局兜底告警：带冷却窗口、异步发送。任何异常都不向上冒泡。
+
+    `cookie_invalid` 不在这里发——它由 Worker 按用户发给该号归属人，
+    再走一遍全局收件人只会重复打扰。
+    """
+
+    try:
+        if error_code in USER_SCOPED_CODES:
+            return False
+        settings = settings or MailSettings.from_environ(os.environ)
+        if not settings.configured or not settings.alert_recipients:
+            return False
+
+        state = _read_state(settings)
+        now = datetime.now(timezone.utc)
+        suppressed = int(state.get("suppressed") or 0)
+        last_raw = state.get("last_sent_at")
+
+        should_send = True
+        if last_raw:
+            try:
+                last = datetime.fromisoformat(last_raw)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                should_send = (
+                    now - last
+                ).total_seconds() >= settings.cooldown_minutes * 60
+            except ValueError:
+                should_send = True
+
+        if not should_send:
+            state["suppressed"] = suppressed + 1
+            _write_state(settings, state)
+            return False
+
+        subject = f"【火花控制台】任务失败：{error_code or stage or '未知原因'}"
+        body = _build_failure_body(stage, error_code, error_summary, suppressed)
+        state["last_sent_at"] = now.isoformat()
+        state["suppressed"] = 0
+        _write_state(settings, state)
+
+        _send_async(settings, settings.alert_recipients, subject, body)
+        return True
+    except Exception:  # noqa: BLE001 —— 通知是旁路，任何情况下都不能影响主流程
+        logger.warning("告警通知流程异常（已忽略）")
+        return False

@@ -71,4 +71,13 @@ def finish_run(
     run.finished_at = _utc(now)
     run.error_code = error_code
     run.error_summary = error_summary[:240] if error_summary else None
+    if status == "failed":
+        # 本仓库新增：失败（含 Cookie 失效）时发告警邮件。
+        # 放在这里是因为 finish_run 是所有失败路径的唯一收尾点；notify 内部
+        # 异步发送且有冷却窗口，不会阻塞当前事务。详见 spark_console/notify.py。
+        from spark_console import notify
+
+        notify.alert_task_failure(
+            stage=stage, error_code=error_code or "", error_summary=run.error_summary or ""
+        )
     return run

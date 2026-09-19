@@ -16,7 +16,10 @@ class DeploymentContractTests(unittest.TestCase):
         worker = self.compose.split("  spark-worker:", 1)[1].split("\nvolumes:", 1)[0]
         self.assertNotIn("ports:", worker)
         self.assertIn('SPARK_WORKER_CONCURRENCY: "1"', worker)
-        self.assertIn("mem_limit: 768m", worker)
+        # Playwright 的 Chromium 在 768m 下会被 OOM killer 杀掉，且渲染需要更大的
+        # /dev/shm（容器默认 64m），所以线上把上限放宽到 1536m 并显式给 512m。
+        self.assertIn("mem_limit: 1536m", worker)
+        self.assertIn("shm_size: 512m", worker)
 
     def test_auth_service_is_unpublished_singleton_and_resource_limited(self):
         auth = self.compose.split("  spark-auth:", 1)[1].split("  spark-worker:", 1)[0]
@@ -24,7 +27,8 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("command: [python, -m, spark_console.auth_worker]", auth)
         self.assertNotIn("ports:", auth)
         self.assertNotIn("/var/run/docker.sock", auth)
-        self.assertIn("mem_limit: 768m", auth)
+        self.assertIn("mem_limit: 1536m", auth)
+        self.assertIn("shm_size: 512m", auth)
         self.assertIn("cpus: 1.0", auth)
         self.assertIn('tmpfs: ["/tmp:rw,noexec,nosuid,size=256m"]', auth)
 

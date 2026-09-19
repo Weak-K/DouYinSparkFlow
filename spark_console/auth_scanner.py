@@ -18,6 +18,17 @@ from core.web_chat import (
 
 CHAT_LOGIN_URL = "https://www.douyin.com/chat"
 ACCOUNT_INFO_URL = "https://www.douyin.com/passport/account/info/v2/?aid=6383"
+# 本仓库新增：真正带「主页昵称 / 抖音号」的两个接口（用已知真值实测命中）：
+#   aweme/v1/web/user/profile/self/  → data.user.nickname / data.user.unique_id
+#   creator.../api/media/user/info/  → data.user.nickname / data.user.unique_id
+# 注意 passport/account/info/v2 只返回通行证账号的系统默认名（如「用户8554931251671」），
+# 不是主页昵称，别用它取名字。
+SELF_PROFILE_URL = (
+    "https://www.douyin.com/aweme/v1/web/user/profile/self/"
+    "?device_platform=webapp&aid=6383&channel=channel_pc_web"
+    "&publish_video_strategy_type=2&version_code=170400&version_name=17.4.0&platform=PC"
+)
+CREATOR_USER_INFO_URL = "https://creator.douyin.com/web/api/media/user/info/"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 LOGIN_PANEL_SELECTORS = (
@@ -173,12 +184,23 @@ class DouyinQrScanner:
                     cancelled,
                     deadline,
                 )
-                display_name = await self._await_stage(
-                    self._optional_text(page, DISPLAY_NAME_SELECTOR),
-                    cancelled,
-                    deadline,
-                ) or "抖音账号"
-                unique_id = await self._await_stage(
+                # 本仓库改动：优先用接口取「主页昵称 / 抖音号」。
+                # 上游原先只读创作者中心页面上的固定 XPath（DISPLAY_NAME_SELECTOR），
+                # 页面改版就失配、回退成「抖音账号」（线上实测就是这种情况）。
+                # 顺序：self/creator 接口 → 原 XPath → 兜底文案。
+                api_nickname, api_unique_id = await self._await_stage(
+                    self._account_identity(context), cancelled, deadline
+                )
+                display_name = (
+                    api_nickname
+                    or await self._await_stage(
+                        self._optional_text(page, DISPLAY_NAME_SELECTOR),
+                        cancelled,
+                        deadline,
+                    )
+                    or "抖音账号"
+                )
+                unique_id = api_unique_id or await self._await_stage(
                     self._optional_text(page, UNIQUE_ID_SELECTOR),
                     cancelled,
                     deadline,
@@ -511,6 +533,37 @@ class DouyinQrScanner:
             and data.get("error_code") == 0
             and data.get("user_id")
         )
+
+    @staticmethod
+    async def _account_identity(context) -> tuple[str | None, str | None]:
+        """本仓库新增：取当前登录账号的（主页昵称, 抖音号）。
+
+        依次尝试：
+          1. www.douyin.com/aweme/v1/web/user/profile/self/  → data.user.nickname / unique_id
+          2. creator.douyin.com/web/api/media/user/info/     → data.user.nickname / unique_id
+        任一成功即返回；都取不到返回 (None, None)。
+        用途：扫码登录后让「账号备注」自动填成真实昵称，不再依赖易失配的页面 XPath
+        （上游原 XPath 指向创作者中心深层 div，页面一改版就命中不了）。
+        这里**只读**昵称与抖音号，不碰手机号等字段，也不打印响应内容。
+        """
+
+        for url in (SELF_PROFILE_URL, CREATOR_USER_INFO_URL):
+            try:
+                response = await context.request.get(url, timeout=10_000)
+                body = await response.json()
+            except Exception:
+                continue
+            data = body.get("data") if isinstance(body, dict) else None
+            user = data.get("user") if isinstance(data, dict) else None
+            if not isinstance(user, dict):
+                continue
+            nickname = user.get("nickname") or user.get("other_nickname")
+            unique_id = user.get("unique_id")
+            nickname = nickname.strip() if isinstance(nickname, str) and nickname.strip() else None
+            unique_id = unique_id.strip() if isinstance(unique_id, str) and unique_id.strip() else None
+            if nickname or unique_id:
+                return nickname, unique_id
+        return None, None
 
     @staticmethod
     def _auth_cookie_fingerprint(cookies) -> frozenset[tuple[str, str, str, str]]:

@@ -35,7 +35,8 @@ services:
   spark-auth:
     <<: *common
     command: [python, -m, spark_console.auth_worker]
-    mem_limit: 768m
+    mem_limit: 1536m
+    shm_size: 512m
     cpus: 1.0
     tmpfs: ["/tmp:rw,noexec,nosuid,size=256m"]
   spark-worker:
@@ -43,7 +44,8 @@ services:
     command: [python, -m, spark_console.worker]
     environment:
       SPARK_WORKER_CONCURRENCY: "1"
-    mem_limit: 768m
+    mem_limit: 1536m
+    shm_size: 512m
     cpus: 1.0
     tmpfs: ["/tmp:rw,noexec,nosuid,size=256m"]
 

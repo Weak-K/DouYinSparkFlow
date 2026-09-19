@@ -254,7 +254,7 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 engine.dispose()
 
-    async def test_worker_skips_the_cookie_email_when_the_owner_has_no_address(self):
+    async def test_worker_defers_to_the_ops_fallback_when_the_owner_has_no_email(self):
         now = datetime(2026, 8, 25, 1, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -280,10 +280,13 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
                             username="sender@example.com",
                             password="secret",
                             sender="sender@example.com",
+                            alert_recipients=("ops@example.com",),
                         ),
                     ).run_once(now)
 
-                sender.assert_not_called()
+                # 收件人为 None：由 notify 层兜底发给运维收件人，而不是静默丢失提醒。
+                self.assertEqual(1, sender.call_count)
+                self.assertIsNone(sender.call_args.args[1])
                 with Session(engine) as session:
                     self.assertEqual(
                         "invalid", session.get(DouyinAccount, account_id).validation_state

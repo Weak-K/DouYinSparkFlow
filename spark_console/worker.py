@@ -206,11 +206,14 @@ class Worker:
             await self._notify_cookie_expired(alert)
         return outcome
 
-    def _mark_cookie_invalid(self, db, account_id: str) -> tuple[str, str, str] | None:
+    def _mark_cookie_invalid(
+        self, db, account_id: str
+    ) -> tuple[str | None, str, str] | None:
         """把抖音号标记为 Cookie 失效，并返回本次需要通知的收件人信息。
 
-        只有在该号由「非失效」变为「失效」、且所属用户填了通知邮箱时才返回，
-        避免每天定时任务把同一封失效邮件反复发出去。
+        只有在该号由「非失效」变为「失效」时才返回，避免每天定时任务把同一封
+        失效邮件反复发出去。所属用户没填邮箱时收件人为 None，
+        由 notify 层兜底发给运维收件人。
         """
 
         row = db.execute(
@@ -228,11 +231,13 @@ class Worker:
             .where(DouyinAccount.id == account_id)
             .values(validation_state="invalid")
         )
-        if already_invalid or not owner_email:
+        if already_invalid:
             return None
         return (owner_email, owner_username, account_name)
 
-    async def _notify_cookie_expired(self, alert: tuple[str, str, str]) -> bool:
+    async def _notify_cookie_expired(
+        self, alert: tuple[str | None, str, str]
+    ) -> bool:
         recipient, owner_username, account_name = alert
         try:
             occurred_at = datetime.now(timezone.utc).astimezone(
