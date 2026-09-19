@@ -20,6 +20,7 @@ from spark_console.models import (
     User,
     WorkerLock,
 )
+from spark_console.notify import MailSettings
 from spark_console.scheduler import claim_next_due_task, compute_next_run
 from spark_console.services.accounts import AccountService
 from spark_console.services.audits import AuditService
@@ -180,6 +181,113 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("cookie_invalid", result.error_code)
                 with Session(engine) as session:
                     self.assertEqual("invalid", session.get(DouyinAccount, account_id).validation_state)
+            finally:
+                engine.dispose()
+
+    async def _build_owner_with_expiring_cookie(self, engine, now, *, email):
+        with Session(engine) as session:
+            user = User(username="alert-owner", password_hash="hash", email=email)
+            session.add(user)
+            session.flush()
+            account = AccountService(
+                session, CookieCipher(b"w" * 32), AuditService(session)
+            ).create(user.id, "提醒账号", '[{"name":"sid","value":"x"}]')
+            account.validation_state = "valid"
+            task = SparkTask(
+                owner_user_id=user.id,
+                douyin_account_id=account.id,
+                target_name="好友",
+                send_time="09:00",
+                message_template="消息",
+                enabled=True,
+                next_run_at=now,
+            )
+            session.add(task)
+            session.commit()
+            return account.id, task.id
+
+    async def test_worker_emails_the_owner_once_when_the_cookie_expires(self):
+        now = datetime(2026, 8, 25, 1, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "cookie.key").write_bytes(b"w" * 32)
+            (data_dir / "session.key").write_bytes(b"s" * 32)
+            settings = Settings(data_dir=data_dir, database_url=f"sqlite:///{data_dir / 'alert.db'}", cookie_key_file=data_dir / "cookie.key", session_key_file=data_dir / "session.key")
+            engine = create_engine(settings.database_url)
+            create_schema(engine)
+            try:
+                account_id, task_id = await self._build_owner_with_expiring_cookie(
+                    engine, now, email="owner@example.com"
+                )
+                mail_settings = MailSettings(
+                    host="smtp.example.com",
+                    username="sender@example.com",
+                    password="secret",
+                    sender="sender@example.com",
+                )
+                with patch(
+                    "spark_console.worker.notify_cookie_expired", return_value=True
+                ) as sender:
+                    worker = Worker(
+                        settings,
+                        engine,
+                        executor=_CookieInvalidExecutor(),
+                        started_at=now,
+                        mail_settings=mail_settings,
+                    )
+                    await worker.run_once(now)
+
+                    # 次日该任务再次到期：账号仍是失效状态，不能再重复打扰用户。
+                    with Session(engine) as session:
+                        session.get(SparkTask, task_id).next_run_at = now - timedelta(minutes=1)
+                        session.commit()
+                    await worker.run_once(now)
+
+                self.assertEqual(1, sender.call_count)
+                self.assertEqual("owner@example.com", sender.call_args.args[1])
+                self.assertEqual("alert-owner", sender.call_args.kwargs["owner_username"])
+                self.assertEqual("提醒账号", sender.call_args.kwargs["account_name"])
+                with Session(engine) as session:
+                    self.assertEqual(
+                        "invalid", session.get(DouyinAccount, account_id).validation_state
+                    )
+            finally:
+                engine.dispose()
+
+    async def test_worker_skips_the_cookie_email_when_the_owner_has_no_address(self):
+        now = datetime(2026, 8, 25, 1, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "cookie.key").write_bytes(b"w" * 32)
+            (data_dir / "session.key").write_bytes(b"s" * 32)
+            settings = Settings(data_dir=data_dir, database_url=f"sqlite:///{data_dir / 'no-email.db'}", cookie_key_file=data_dir / "cookie.key", session_key_file=data_dir / "session.key")
+            engine = create_engine(settings.database_url)
+            create_schema(engine)
+            try:
+                account_id, _task_id = await self._build_owner_with_expiring_cookie(
+                    engine, now, email=None
+                )
+                with patch(
+                    "spark_console.worker.notify_cookie_expired", return_value=True
+                ) as sender:
+                    await Worker(
+                        settings,
+                        engine,
+                        executor=_CookieInvalidExecutor(),
+                        started_at=now,
+                        mail_settings=MailSettings(
+                            host="smtp.example.com",
+                            username="sender@example.com",
+                            password="secret",
+                            sender="sender@example.com",
+                        ),
+                    ).run_once(now)
+
+                sender.assert_not_called()
+                with Session(engine) as session:
+                    self.assertEqual(
+                        "invalid", session.get(DouyinAccount, account_id).validation_state
+                    )
             finally:
                 engine.dispose()
 

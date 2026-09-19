@@ -25,6 +25,8 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
     username: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    # 通知邮箱：该用户名下抖音号 Cookie 失效时，提醒邮件只发给他本人。
+    email: Mapped[str | None] = mapped_column(String(254), index=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")

@@ -16,6 +16,7 @@ from spark_console.db import create_engine_for, create_schema, session_scope
 from spark_console.models import User
 from spark_console.security import PasswordService
 from spark_console.services.accounts import AccountService
+from spark_console.services import ValidationError
 from spark_console.services.audits import AuditService
 from spark_console.services.tasks import TaskService
 from spark_console.services.users import UserService
@@ -34,16 +35,26 @@ def command_create_admin(args) -> int:
     confirmation = getpass.getpass("再次输入: ")
     if password != confirmation:
         raise SystemExit("两次密码不一致")
-    with session_scope(engine) as db:
-        UserService(db, PasswordService(), AuditService(db)).create(args.username, password, "admin")
+    try:
+        with session_scope(engine) as db:
+            UserService(db, PasswordService(), AuditService(db)).create(
+                args.username, password, "admin", email=args.email
+            )
+    except ValidationError as error:
+        raise SystemExit(f"创建失败：{error}") from error
     print("管理员已创建；首次登录必须修改密码。")
     return 0
 
 
 def command_create_user(args) -> int:
     _settings, engine = runtime()
-    with session_scope(engine) as db:
-        _user, temporary = UserService(db, PasswordService(), AuditService(db)).create(args.username)
+    try:
+        with session_scope(engine) as db:
+            _user, temporary = UserService(db, PasswordService(), AuditService(db)).create(
+                args.username, email=args.email
+            )
+    except ValidationError as error:
+        raise SystemExit(f"创建失败：{error}") from error
     print(f"临时密码（仅显示一次）: {temporary}")
     return 0
 
@@ -83,8 +94,8 @@ def command_backup(_args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="spark-console")
     commands = parser.add_subparsers(required=True)
-    admin = commands.add_parser("create-admin"); admin.add_argument("username"); admin.set_defaults(handler=command_create_admin)
-    user = commands.add_parser("create-user"); user.add_argument("username"); user.set_defaults(handler=command_create_user)
+    admin = commands.add_parser("create-admin"); admin.add_argument("username"); admin.add_argument("--email", default=None, help="Cookie 失效提醒邮箱（可在控制台里补填）"); admin.set_defaults(handler=command_create_admin)
+    user = commands.add_parser("create-user"); user.add_argument("username"); user.add_argument("--email", default=None, help="Cookie 失效提醒邮箱（可在控制台里补填）"); user.set_defaults(handler=command_create_user)
     legacy = commands.add_parser("import-legacy"); legacy.add_argument("path"); legacy.add_argument("--owner", required=True); legacy.add_argument("--time", default="09:00"); legacy.add_argument("--message", default="今日火花"); legacy.set_defaults(handler=command_import_legacy)
     backup = commands.add_parser("backup-db"); backup.set_defaults(handler=command_backup)
     return parser

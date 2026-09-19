@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import secrets
 import string
 
@@ -10,6 +11,27 @@ from spark_console.models import DouyinAccount, SparkTask, User, WebSession
 from spark_console.security import PasswordService
 from spark_console.services import Conflict, NotFound, ValidationError
 from spark_console.services.audits import AuditService
+
+
+EMAIL_MAX_LENGTH = 254
+_EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$"
+)
+
+
+def normalize_email(raw: str, *, required: bool = False) -> str | None:
+    """校验并规范化通知邮箱；未填写且非必填时返回 None。"""
+
+    value = (raw or "").strip()
+    if not value:
+        if required:
+            raise ValidationError("请填写通知邮箱")
+        return None
+    if len(value) > EMAIL_MAX_LENGTH or _EMAIL_PATTERN.match(value) is None:
+        raise ValidationError("邮箱格式不正确")
+    return value.lower()
 
 
 def validate_registration_password(password: str) -> None:
@@ -32,7 +54,13 @@ class UserService:
         alphabet = string.ascii_letters + string.digits + "!@#$%"
         return "".join(secrets.choice(alphabet) for _ in range(18))
 
-    def create(self, username: str, password: str | None = None, role: str = "user") -> tuple[User, str]:
+    def create(
+        self,
+        username: str,
+        password: str | None = None,
+        role: str = "user",
+        email: str | None = None,
+    ) -> tuple[User, str]:
         name = username.strip().lower()
         if not (3 <= len(name) <= 32) or not all(c.isalnum() or c in "_-" for c in name):
             raise ValidationError("用户名须为 3–32 位字母、数字、下划线或短横线")
@@ -40,9 +68,11 @@ class UserService:
             raise ValidationError("invalid role")
         if self.session.scalar(select(User).where(User.username == name)):
             raise Conflict("用户名已存在")
+        address = normalize_email(email or "")
         temporary = password or self.temporary_password()
         user = User(
             username=name,
+            email=address,
             password_hash=self.passwords.hash(temporary),
             role=role,
             must_change_password=True,
@@ -51,6 +81,14 @@ class UserService:
         self.session.flush()
         self.audit.write(None, "user.created", "user", user.id)
         return user, temporary
+
+    def set_email(self, actor_id: str, user_id: str, email: str) -> User:
+        user = self.session.get(User, user_id)
+        if user is None:
+            raise NotFound("user not found")
+        user.email = normalize_email(email, required=True)
+        self.audit.write(actor_id, "user.email_updated", "user", user.id)
+        return user
 
     def authenticate(self, username: str, password: str) -> User | None:
         user = self.session.scalar(select(User).where(User.username == username.strip().lower()))

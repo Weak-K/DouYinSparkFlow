@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import socket
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, update
 
@@ -17,11 +19,16 @@ from spark_console.models import (
     SparkTask,
     SparkTaskTargetIdentity,
     TaskRun,
+    User,
     WorkerLock,
 )
+from spark_console.notify import MailSettings, notify_cookie_expired
 from spark_console.scheduler import claim_next_due_task, finish_run
 from spark_console.services.accounts import AccountService
 from spark_console.services.audits import AuditService
+
+
+logger = logging.getLogger("spark.worker")
 
 
 class Worker:
@@ -37,6 +44,7 @@ class Worker:
         clock_offset_seconds=0.0,
         started_at: datetime | None = None,
         execution_timeout_seconds: float | None = None,
+        mail_settings: MailSettings | None = None,
     ):
         self.settings = settings
         self.engine = engine
@@ -47,6 +55,7 @@ class Worker:
         self.execution_timeout_seconds = (
             execution_timeout_seconds or self.EXECUTION_TIMEOUT_SECONDS
         )
+        self.mail_settings = mail_settings or MailSettings.from_environ(os.environ)
         self.cipher = CookieCipher(settings.cookie_key_file.read_bytes())
         self._recover_interrupted_runs()
 
@@ -142,11 +151,12 @@ class Worker:
             cookies[:] = b"\0" * len(cookies)
             cookies.clear()
 
+        alert: tuple[str, str, str] | None = None
         with session_scope(self.engine) as db:
             run = db.get(TaskRun, run_id)
             task = db.get(SparkTask, task_id)
             if timed_out:
-                return finish_run(
+                outcome = finish_run(
                     run,
                     "failed",
                     "worker_timeout",
@@ -154,8 +164,8 @@ class Worker:
                     "execution_timeout",
                     "页面操作超过 3 分钟，已终止本次执行",
                 )
-            if result is None:
-                return finish_run(
+            elif result is None:
+                outcome = finish_run(
                     run,
                     "failed",
                     "worker_error",
@@ -163,35 +173,88 @@ class Worker:
                     "unexpected_error",
                     "任务执行发生意外异常，Worker 已继续运行",
                 )
-            if result.success:
-                db.execute(
-                    update(DouyinAccount)
-                    .where(DouyinAccount.id == account_id)
-                    .values(
-                        validation_state="valid",
-                        last_verified_at=datetime.now(timezone.utc),
+            else:
+                if result.success:
+                    db.execute(
+                        update(DouyinAccount)
+                        .where(DouyinAccount.id == account_id)
+                        .values(
+                            validation_state="valid",
+                            last_verified_at=datetime.now(timezone.utc),
+                        )
+                    )
+                elif result.error_code == "cookie_invalid":
+                    alert = self._mark_cookie_invalid(db, account_id)
+                retry = None
+                if not result.success and result.retryable:
+                    retry = self._schedule_retry(
+                        db, task, run, current_time, result.stage
+                    )
+                outcome = (
+                    retry
+                    if retry is not None
+                    else finish_run(
+                        run,
+                        "success" if result.success else "failed",
+                        result.stage,
+                        datetime.now(timezone.utc),
+                        result.error_code,
+                        result.error_summary,
                     )
                 )
-            elif result.error_code == "cookie_invalid":
-                db.execute(
-                    update(DouyinAccount)
-                    .where(DouyinAccount.id == account_id)
-                    .values(validation_state="invalid")
-                )
-            if not result.success and result.retryable:
-                retry = self._schedule_retry(
-                    db, task, run, current_time, result.stage
-                )
-                if retry is not None:
-                    return retry
-            return finish_run(
-                run,
-                "success" if result.success else "failed",
-                result.stage,
-                datetime.now(timezone.utc),
-                result.error_code,
-                result.error_summary,
+        if alert is not None:
+            await self._notify_cookie_expired(alert)
+        return outcome
+
+    def _mark_cookie_invalid(self, db, account_id: str) -> tuple[str, str, str] | None:
+        """把抖音号标记为 Cookie 失效，并返回本次需要通知的收件人信息。
+
+        只有在该号由「非失效」变为「失效」、且所属用户填了通知邮箱时才返回，
+        避免每天定时任务把同一封失效邮件反复发出去。
+        """
+
+        row = db.execute(
+            select(DouyinAccount, User.email, User.username)
+            .join(User, DouyinAccount.owner_user_id == User.id)
+            .where(DouyinAccount.id == account_id)
+        ).first()
+        if row is None:
+            return None
+        account, owner_email, owner_username = row
+        already_invalid = account.validation_state == "invalid"
+        account_name = account.display_name
+        db.execute(
+            update(DouyinAccount)
+            .where(DouyinAccount.id == account_id)
+            .values(validation_state="invalid")
+        )
+        if already_invalid or not owner_email:
+            return None
+        return (owner_email, owner_username, account_name)
+
+    async def _notify_cookie_expired(self, alert: tuple[str, str, str]) -> bool:
+        recipient, owner_username, account_name = alert
+        try:
+            occurred_at = datetime.now(timezone.utc).astimezone(
+                ZoneInfo(self.settings.timezone)
+            ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        except (ZoneInfoNotFoundError, ValueError):
+            occurred_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        try:
+            sent = await asyncio.to_thread(
+                notify_cookie_expired,
+                self.mail_settings,
+                recipient,
+                owner_username=owner_username,
+                account_name=account_name,
+                occurred_at=occurred_at,
             )
+        except Exception:
+            logger.exception("Cookie 失效通知发送异常，已忽略以免影响 Worker")
+            return False
+        if sent:
+            logger.info("Cookie 失效通知已发送")
+        return sent
 
     def _schedule_retry(self, db, task, run, now, stage):
         retry_codes = tuple(

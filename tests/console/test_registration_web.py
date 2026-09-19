@@ -89,6 +89,7 @@ class RegistrationWebTests(unittest.TestCase):
     def registration_data(self, username="newfriend", invite_code=None, **overrides):
         data = {
             "username": username,
+            "email": "newfriend@example.com",
             "password": "StrongPass10",
             "password_confirmation": "StrongPass10",
             "invite_code": self.invite_plaintext if invite_code is None else invite_code,
@@ -113,6 +114,31 @@ class RegistrationWebTests(unittest.TestCase):
             user = session.scalar(select(User).where(User.username == "newfriend"))
             self.assertEqual("user", user.role)
             self.assertFalse(user.must_change_password)
+            self.assertEqual("newfriend@example.com", user.email)
+
+    def test_registration_normalizes_the_notification_email(self):
+        response = self.client.post(
+            "/register",
+            data=self.registration_data(email="  NewFriend@Example.COM  "),
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        with Session(self.engine) as session:
+            user = session.scalar(select(User).where(User.username == "newfriend"))
+            self.assertEqual("newfriend@example.com", user.email)
+
+    def test_invalid_notification_email_returns_public_error_without_creating_user(self):
+        for index, email in enumerate(("not-an-email", "missing@tld", "with space@example.com")):
+            response = self.client.post(
+                "/register",
+                data=self.registration_data(username=f"badmail{index}", email=email),
+                follow_redirects=False,
+            )
+            self.assertEqual(400, response.status_code, email)
+            self.assertIn(PUBLIC_ERROR, response.text)
+        with Session(self.engine) as session:
+            self.assertIsNone(session.scalar(select(User).where(User.username == "badmail0")))
 
     def test_password_mismatch_returns_public_error_without_creating_user(self):
         response = self.client.post(
@@ -166,7 +192,9 @@ class RegistrationWebTests(unittest.TestCase):
             {key: value for key, value in complete.items() if key != field}
             for field in complete
         ]
-        for index, data in enumerate(missing_fields + [missing_fields[-1]] * 6):
+        # 失败次数必须正好等于限流上限 10 次，多一次就会拿到 429。
+        self.assertEqual(10, len(missing_fields) + 5)
+        for index, data in enumerate(missing_fields + [missing_fields[-1]] * 5):
             response = self.client.post("/register", data=data, follow_redirects=False)
             self.assertEqual(400, response.status_code, f"missing field attempt {index}")
             self.assertIn(PUBLIC_ERROR, response.text)
@@ -213,6 +241,13 @@ class RegistrationWebTests(unittest.TestCase):
 
         self.assertIn("3–32 位字母、数字、下划线或短横线", response.text)
         self.assertIn("至少 10 位，并同时包含字母和数字", response.text)
+
+    def test_register_page_collects_a_required_notification_email(self):
+        response = self.client.get("/register")
+
+        self.assertIn('name="email"', response.text)
+        self.assertIn('type="email"', response.text)
+        self.assertIn("Cookie 失效", response.text)
 
     def test_invite_generation_redirects_to_get_and_remains_visible_encrypted(self):
         self.login("friend", "FriendPass123")
@@ -310,6 +345,51 @@ class RegistrationWebTests(unittest.TestCase):
         self.assertIn("friend", response.text)
         self.assertIn("成功", response.text)
         self.assertIn('class="actions action-group"', response.text)
+
+    def test_admin_page_shows_each_user_notification_email(self):
+        with session_scope(self.engine) as session:
+            session.get(User, self.friend.id).email = "friend@example.com"
+        self.login()
+
+        response = self.client.get("/admin")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("提醒邮箱：friend@example.com", response.text)
+        self.assertIn("提醒邮箱：未填写", response.text)
+
+    def test_admin_can_create_a_user_with_a_notification_email(self):
+        self.login()
+
+        response = self.client.post(
+            "/admin/users",
+            data={
+                "csrf_token": self.csrf_for(),
+                "username": "withmail",
+                "email": "WithMail@Example.com",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(200, response.status_code)
+        with Session(self.engine) as session:
+            self.assertEqual(
+                "withmail@example.com",
+                session.scalar(select(User.email).where(User.username == "withmail")),
+            )
+
+    def test_admin_user_creation_rejects_a_bad_notification_email(self):
+        self.login()
+
+        response = self.client.post(
+            "/admin/users",
+            data={"csrf_token": self.csrf_for(), "username": "badmail", "email": "nope"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertIn("notice=user_invalid", response.headers["location"])
+        with Session(self.engine) as session:
+            self.assertIsNone(session.scalar(select(User).where(User.username == "badmail")))
 
     def test_invite_revoke_requires_csrf(self):
         with session_scope(self.engine) as session:

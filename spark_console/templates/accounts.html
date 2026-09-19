@@ -7,6 +7,24 @@
   </div>
 </header>
 
+<section class="panel notify-panel">
+  <div class="section-head">
+    <div>
+      <span class="section-kicker">COOKIE ALERT</span>
+      <h2>Cookie 失效提醒邮箱</h2>
+      <p>你名下任一抖音号 Cookie 失效时，提醒邮件只发到这个邮箱；别人添加的抖音号不会打扰你。</p>
+    </div>
+  </div>
+  {% if request.query_params.get('email') == 'saved' %}<div class="form-ok" role="status">通知邮箱已保存</div>{% endif %}
+  {% if request.query_params.get('email') == 'invalid' %}<div class="form-error" role="alert">邮箱格式不正确，请检查后重新保存</div>{% endif %}
+  <form method="post" action="/account/email" class="inline-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="sr-only" for="notify-email">通知邮箱</label>
+    <input id="notify-email" type="email" name="email" maxlength="254" value="{{ user.email or '' }}" placeholder="you@example.com" required>
+    <button type="submit">保存邮箱</button>
+  </form>
+</section>
+
 <div class="split accounts-layout">
   <section class="panel account-list">
     <h2>已绑定账号</h2>

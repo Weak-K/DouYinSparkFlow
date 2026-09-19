@@ -17,7 +17,11 @@ from spark_console.security import PasswordService
 from spark_console.services import Conflict, ValidationError
 from spark_console.services.audits import AuditService
 from spark_console.services.invites import InviteService
-from spark_console.services.users import UserService, validate_registration_password
+from spark_console.services.users import (
+    UserService,
+    normalize_email,
+    validate_registration_password,
+)
 from spark_console.web.auth import WebAuth
 from spark_console.models import InviteCode, SparkTask, TaskRun, User
 
@@ -79,6 +83,7 @@ def build_registration_router(
     def register(
         request: Request,
         username: str = Form(default=""),
+        email: str = Form(default=""),
         password: str = Form(default=""),
         password_confirmation: str = Form(default=""),
         invite_code: str = Form(default=""),
@@ -91,8 +96,10 @@ def build_registration_router(
                 validate_registration_password(password)
                 if password != password_confirmation:
                     raise ValidationError(PUBLIC_ERROR)
+                # 通知邮箱必填：该用户名下抖音号 Cookie 失效时，提醒邮件只发给他本人。
+                address = normalize_email(email, required=True)
                 user, _ = UserService(db, passwords, AuditService(db)).create(
-                    username, password, "user"
+                    username, password, "user", email=address
                 )
                 user.must_change_password = False
                 InviteService(db, AuditService(db), cipher).consume(

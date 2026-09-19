@@ -93,6 +93,9 @@ ADMIN_NOTICES = {
     "retry_scheduled": "已安排 1 分钟后安全重试",
     "retry_already_scheduled": "该失败记录已经安排过重试",
     "retry_not_allowed": "该记录可能已提交发送，不能快捷重试",
+    "user_created": "用户已创建，请把一次性密码转交给本人",
+    "user_conflict": "用户名已存在，用户未创建",
+    "user_invalid": "用户名或通知邮箱格式不正确，用户未创建",
 }
 
 
@@ -449,6 +452,23 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
             AccountService(db, cipher, AuditService(db)).delete_owned(user.id, account_id)
         return RedirectResponse("/accounts", status_code=303)
 
+    @app.post("/account/email")
+    def update_notification_email(
+        request: Request,
+        csrf_token: str = Form(default=""),
+        email: str = Form(default=""),
+    ):
+        try:
+            with session_scope(engine) as db:
+                user, record = auth.current(request, db)
+                auth.csrf(record, csrf_token)
+                UserService(db, passwords, AuditService(db)).set_email(
+                    user.id, user.id, email
+                )
+        except ValidationError:
+            return RedirectResponse("/accounts?email=invalid", status_code=303)
+        return RedirectResponse("/accounts?email=saved", status_code=303)
+
     @app.get("/accounts/{account_id}/conversations")
     def account_conversations(request: Request, account_id: str):
         with session_scope(engine) as db:
@@ -643,20 +663,31 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
             )
 
     @app.post("/admin/users")
-    def admin_create_user(request: Request, csrf_token: str = Form(default=""), username: str = Form()):
-        with session_scope(engine) as db:
-            admin, record, context = auth.admin_context(request, db)
-            auth.csrf(record, csrf_token)
-            service = UserService(db, passwords, AuditService(db))
-            _user, temporary = service.create(username)
-            return page(
-                request,
-                "admin.html",
-                title="管理后台",
-                one_time_password=temporary,
-                **admin_dashboard_context(request, db),
-                **context,
-            )
+    def admin_create_user(
+        request: Request,
+        csrf_token: str = Form(default=""),
+        username: str = Form(),
+        email: str = Form(default=""),
+    ):
+        try:
+            with session_scope(engine) as db:
+                admin, record, context = auth.admin_context(request, db)
+                auth.csrf(record, csrf_token)
+                service = UserService(db, passwords, AuditService(db))
+                # 邮箱可以在这一步先填好，也可以留空由用户登录后自己在「抖音账号」页补。
+                _user, temporary = service.create(username, email=email)
+                return page(
+                    request,
+                    "admin.html",
+                    title="管理后台",
+                    one_time_password=temporary,
+                    **admin_dashboard_context(request, db),
+                    **context,
+                )
+        except Conflict:
+            return RedirectResponse(admin_url(request, "user_conflict"), status_code=303)
+        except ValidationError:
+            return RedirectResponse(admin_url(request, "user_invalid"), status_code=303)
 
     @app.post("/admin/users/{user_id}/toggle")
     def admin_toggle_user(request: Request, user_id: str, csrf_token: str = Form(default="")):

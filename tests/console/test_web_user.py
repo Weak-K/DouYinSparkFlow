@@ -104,6 +104,65 @@ class UserWebTests(unittest.TestCase):
         self.assertIn("修改密码", change_page.text)
         self.assertIn('name="new_password_confirmation"', change_page.text)
 
+    def complete_first_login(self):
+        self.login()
+        page = self.client.get("/change-password")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        self.client.post(
+            "/change-password",
+            data={
+                "csrf_token": csrf,
+                "current_password": "Temporary-123!",
+                "new_password": "Permanent-123!",
+                "new_password_confirmation": "Permanent-123!",
+            },
+        )
+
+    def test_user_can_save_the_cookie_alert_email(self):
+        self.complete_first_login()
+        accounts = self.client.get("/accounts")
+        csrf = accounts.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+        saved = self.client.post(
+            "/account/email",
+            data={"csrf_token": csrf, "email": "Friend@Example.com"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, saved.status_code)
+        self.assertEqual("/accounts?email=saved", saved.headers["location"])
+        with session_scope(self.engine) as session:
+            user = session.scalar(select(User).where(User.username == "friend"))
+            self.assertEqual("friend@example.com", user.email)
+        refreshed = self.client.get("/accounts?email=saved")
+        self.assertIn("friend@example.com", refreshed.text)
+        self.assertIn("通知邮箱已保存", refreshed.text)
+        self.assertIn("Cookie 失效提醒邮箱", refreshed.text)
+        invalid = self.client.get("/accounts?email=invalid")
+        self.assertIn("邮箱格式不正确", invalid.text)
+
+    def test_user_email_update_rejects_bad_address_and_missing_csrf(self):
+        self.complete_first_login()
+        accounts = self.client.get("/accounts")
+        csrf = accounts.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+        bad = self.client.post(
+            "/account/email",
+            data={"csrf_token": csrf, "email": "not-an-email"},
+            follow_redirects=False,
+        )
+        no_csrf = self.client.post(
+            "/account/email", data={"email": "owner@example.com"}, follow_redirects=False
+        )
+
+        self.assertEqual(303, bad.status_code)
+        self.assertEqual("/accounts?email=invalid", bad.headers["location"])
+        self.assertEqual(403, no_csrf.status_code)
+        with session_scope(self.engine) as session:
+            self.assertIsNone(
+                session.scalar(select(User.email).where(User.username == "friend"))
+            )
+
     def test_change_password_page_uses_centered_security_layout(self):
         self.login()
 

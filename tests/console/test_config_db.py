@@ -3,6 +3,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from spark_console.config import Settings
@@ -16,6 +17,21 @@ from spark_console.models import (
     SparkTask,
     User,
     utc_now,
+)
+
+
+LEGACY_USERS_TABLE = (
+    "CREATE TABLE users ("
+    "id VARCHAR(36) PRIMARY KEY, "
+    "username VARCHAR(32) UNIQUE NOT NULL, "
+    "password_hash TEXT NOT NULL, "
+    "role VARCHAR(16) NOT NULL, "
+    "status VARCHAR(16) NOT NULL, "
+    "must_change_password BOOLEAN NOT NULL, "
+    "failed_login_count INTEGER NOT NULL, "
+    "locked_until DATETIME, "
+    "created_at DATETIME NOT NULL, "
+    "updated_at DATETIME NOT NULL)"
 )
 
 
@@ -75,6 +91,43 @@ class SettingsTests(unittest.TestCase):
                 }
             )
             self.assertFalse(settings.secure_cookies)
+
+
+class SchemaUpgradeTests(unittest.TestCase):
+    """线上库早于当前模型，create_all 不会补列，必须靠 upgrade_existing_tables。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.engine = create_engine(f"sqlite:///{Path(self.temp.name) / 'legacy.db'}")
+
+    def tearDown(self):
+        self.engine.dispose()
+        self.temp.cleanup()
+
+    def test_legacy_database_gains_the_notification_email_column(self):
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(LEGACY_USERS_TABLE)
+
+        create_schema(self.engine)
+
+        columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
+        self.assertIn("email", columns)
+        with session_scope(self.engine) as session:
+            session.add(
+                User(username="legacy", email="legacy@example.com", password_hash="hash")
+            )
+        with session_scope(self.engine) as session:
+            self.assertEqual(
+                "legacy@example.com",
+                session.scalar(select(User.email).where(User.username == "legacy")),
+            )
+
+    def test_repeated_schema_creation_stays_idempotent(self):
+        create_schema(self.engine)
+        create_schema(self.engine)
+
+        columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
+        self.assertIn("email", columns)
 
 
 class DatabaseTests(unittest.TestCase):

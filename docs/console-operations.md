@@ -126,6 +126,36 @@ docker compose -f compose.console.yml ps
 
 不要在日志中输出 Cookie、密码、环境变量或聊天正文。只报告任务 ID、阶段、成功/失败及脱敏错误码。
 
+## Cookie 失效提醒邮件
+
+每个控制台账号在注册时必须填写**自己的通知邮箱**（`users.email`）。账号下绑定的抖音号各不相同，所以提醒邮件只发给该抖音号所属的用户本人，不存在全局收件人。
+
+- 触发点：Worker 执行任务时，抖音号返回 `cookie_invalid`，账号状态由「正常」变为「需要重新登录」。再次执行时不会重复发送，避免每天轰炸。
+- 收件人为空（管理员建号时未填、用户自己也没补）时跳过发送，只在日志留一条 warning。
+- SMTP 未配置时同样跳过发送，绝不影响任务执行与重试。
+
+在 `.env.console` 中填写发件邮箱（以 QQ 邮箱为例，授权码不是登录密码）：
+
+```bash
+SPARK_SMTP_HOST=smtp.qq.com
+SPARK_SMTP_PORT=465
+SPARK_SMTP_SECURITY=ssl
+SPARK_SMTP_USER=发件邮箱@qq.com
+SPARK_SMTP_PASSWORD=邮箱授权码
+SPARK_SMTP_FROM=
+```
+
+`SPARK_SMTP_SECURITY` 可选 `ssl`（465）、`starttls`（587）、`plain`；`SPARK_SMTP_FROM` 留空时用 `SPARK_SMTP_USER`。
+
+改完只重启 Worker 即可，不需要重建镜像：
+
+```bash
+docker compose --env-file .env.console -f compose.console.yml up -d --force-recreate spark-worker
+docker compose --env-file .env.console -f compose.console.yml logs --tail=50 spark-worker
+```
+
+用户可在控制台「抖音账号」页随时改自己的通知邮箱；管理后台的用户列表会显示每人当前邮箱，未填写时显示「未填写」。排查发信问题时可临时把 `SPARK_SMTP_HOST` 指向本机调试 SMTP，日志只记录“已发送/未配置/发送失败”，不记录收件人与正文。
+
 ## 备份与回滚
 
 ```bash
