@@ -34,6 +34,10 @@ class ExecutionResult:
     error_code: str | None = None
     error_summary: str | None = None
     retryable: bool = False
+    # 本次实际在聊天页看到的好友名 / 抓到的身份，交给 worker 刷新好友快照。
+    # 失败路径也会带上，这样「没找到目标」时也能顺便把名单更新掉。
+    discovered_names: tuple[str, ...] = ()
+    discovered_identities: tuple = ()
 
 
 class DouyinExecutor:
@@ -44,12 +48,15 @@ class DouyinExecutor:
         message: str,
         credential_version: int = 1,
         target_sec_uid: str | None = None,
+        refresh_targets: bool = False,
     ) -> ExecutionResult:
         from playwright.async_api import async_playwright
         from core.tasks import confirm_message_sent
 
         stage = ExecutionStage.AUTHENTICATING
         message_submitted = False
+        discovered: list[str] = []
+        identities: tuple = ()
         try:
             payload = CredentialPayload.parse(bytes(cookie_payload), credential_version)
             async with async_playwright() as playwright:
@@ -62,7 +69,7 @@ class DouyinExecutor:
                         await context.add_cookies(legacy_cookies)
                     page = await context.new_page()
                     user_info = UserInfoCollector()
-                    if target_sec_uid:
+                    if target_sec_uid or refresh_targets:
                         page.on("response", user_info.capture)
                     await page.goto(WEB_CHAT_URL, wait_until="domcontentloaded", timeout=120000)
                     stage = ExecutionStage.SELECTING_TARGET
@@ -76,6 +83,8 @@ class DouyinExecutor:
                         target,
                         timeout=45000,
                         aliases=identity.aliases if identity else (),
+                        scroll=refresh_targets,
+                        discovered=discovered,
                     )
                     await page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=30000)
                     stage = ExecutionStage.SENDING
@@ -88,6 +97,8 @@ class DouyinExecutor:
                     message_submitted = True
                     await editor.press("Enter")
                     stage = ExecutionStage.CONFIRMING
+                    if refresh_targets:
+                        identities = await user_info.drain()
                     try:
                         await confirm_message_sent(page, editor, message, timeout=20000)
                     except Exception:
@@ -96,8 +107,15 @@ class DouyinExecutor:
                             ExecutionStage.SUBMITTED,
                             "delivery_confirmation_unavailable",
                             "消息已提交，页面未能二次确认",
+                            discovered_names=tuple(discovered),
+                            discovered_identities=identities,
                         )
-                    return ExecutionResult(True, ExecutionStage.COMPLETE)
+                    return ExecutionResult(
+                        True,
+                        ExecutionStage.COMPLETE,
+                        discovered_names=tuple(discovered),
+                        discovered_identities=identities,
+                    )
                 finally:
                     try:
                         if context is not None:
@@ -105,7 +123,13 @@ class DouyinExecutor:
                     finally:
                         await browser.close()
         except TargetNotFoundError:
-            return ExecutionResult(False, ExecutionStage.SELECTING_TARGET, "target_not_found", "未找到完全匹配的目标好友")
+            return ExecutionResult(
+                False,
+                ExecutionStage.SELECTING_TARGET,
+                "target_not_found",
+                "未找到完全匹配的目标好友",
+                discovered_names=tuple(discovered),
+            )
         except CredentialError:
             return ExecutionResult(False, ExecutionStage.AUTHENTICATING, "cookie_invalid", "账号凭据格式无效")
         except Exception as error:
@@ -121,6 +145,7 @@ class DouyinExecutor:
                     "conversation_not_opened",
                     "已找到好友，但聊天窗口没有打开",
                     retryable=True,
+                    discovered_names=tuple(discovered),
                 )
             return ExecutionResult(
                 False,
@@ -128,4 +153,5 @@ class DouyinExecutor:
                 "automation_failed",
                 "页面操作或发送确认失败",
                 retryable=not message_submitted,
+                discovered_names=tuple(discovered),
             )

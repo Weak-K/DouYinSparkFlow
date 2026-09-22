@@ -14,12 +14,15 @@ from spark_console.db import create_schema
 from spark_console.executor import ExecutionResult, ExecutionStage
 from spark_console.models import (
     DouyinAccount,
+    DouyinContactIdentity,
+    DouyinConversation,
     SparkTask,
     SparkTaskTargetIdentity,
     TaskRun,
     User,
     WorkerLock,
 )
+from core.web_chat import DouyinUserIdentity
 from spark_console.notify import MailSettings
 from spark_console.scheduler import claim_next_due_task, compute_next_run
 from spark_console.services.accounts import AccountService
@@ -56,10 +59,13 @@ class SchedulerTests(unittest.TestCase):
 
 
 class _RecordingExecutor:
-    def __init__(self):
+    def __init__(self, discovered_names=(), discovered_identities=()):
         self.credential_version = None
         self.payload_reference = None
         self.target_sec_uid = None
+        self.refresh_targets = None
+        self._discovered_names = tuple(discovered_names)
+        self._discovered_identities = tuple(discovered_identities)
 
     async def execute(
         self,
@@ -68,11 +74,18 @@ class _RecordingExecutor:
         message,
         credential_version=1,
         target_sec_uid=None,
+        refresh_targets=False,
     ):
         self.credential_version = credential_version
         self.payload_reference = cookie_payload
         self.target_sec_uid = target_sec_uid
-        return ExecutionResult(True, ExecutionStage.COMPLETE)
+        self.refresh_targets = refresh_targets
+        return ExecutionResult(
+            True,
+            ExecutionStage.COMPLETE,
+            discovered_names=self._discovered_names,
+            discovered_identities=self._discovered_identities,
+        )
 
 
 class _RaisingExecutor:
@@ -123,6 +136,37 @@ class _HangingExecutor:
         except asyncio.CancelledError:
             self.cancelled = True
             raise
+
+
+def _worker_settings(data_dir: Path) -> Settings:
+    cookie_key = data_dir / "cookie.key"
+    session_key = data_dir / "session.key"
+    cookie_key.write_bytes(b"w" * 32)
+    session_key.write_bytes(b"s" * 32)
+    return Settings(
+        data_dir=data_dir,
+        database_url=f"sqlite:///{data_dir / 'worker.db'}",
+        cookie_key_file=cookie_key,
+        session_key_file=session_key,
+    )
+
+
+def _storage_state() -> dict:
+    return {
+        "cookies": [
+            {
+                "name": "sid",
+                "value": "worker-secret-marker",
+                "domain": ".douyin.com",
+                "path": "/",
+                "expires": -1,
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        ],
+        "origins": [],
+    }
 
 
 class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
@@ -829,6 +873,136 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
                 with Session(engine) as session:
                     persisted = session.scalar(select(TaskRun))
                     self.assertEqual("failed", persisted.status)
+            finally:
+                engine.dispose()
+
+    async def test_worker_refreshes_the_friend_snapshot_only_when_it_is_stale(self):
+        now = datetime(2026, 9, 22, 1, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            settings = _worker_settings(data_dir)
+            engine = create_engine(settings.database_url)
+            create_schema(engine)
+            try:
+                with Session(engine) as session:
+                    user = User(username="snapshot-owner", password_hash="hash")
+                    session.add(user)
+                    session.flush()
+                    service = AccountService(
+                        session, CookieCipher(b"w" * 32), AuditService(session)
+                    )
+                    stale_account = service.create_from_storage_state(
+                        user.id, "没有快照的账号", _storage_state()
+                    )
+                    fresh_account = service.create_from_storage_state(
+                        user.id,
+                        "刚刷新过的账号",
+                        _storage_state(),
+                        conversation_names=("最近聊过的好友",),
+                    )
+                    for conversation in session.scalars(
+                        select(DouyinConversation)
+                    ).all():
+                        conversation.discovered_at = now
+                    session.add(
+                        SparkTask(
+                            owner_user_id=user.id,
+                            douyin_account_id=stale_account.id,
+                            target_name="好友",
+                            send_time="09:00",
+                            message_template="今日火花",
+                            enabled=True,
+                            next_run_at=now - timedelta(minutes=2),
+                        )
+                    )
+                    session.add(
+                        SparkTask(
+                            owner_user_id=user.id,
+                            douyin_account_id=fresh_account.id,
+                            target_name="好友",
+                            send_time="09:00",
+                            message_template="今日火花",
+                            enabled=True,
+                            next_run_at=now - timedelta(minutes=1),
+                        )
+                    )
+                    session.commit()
+
+                executor = _RecordingExecutor()
+                worker = Worker(
+                    settings,
+                    engine,
+                    executor=executor,
+                    started_at=now - timedelta(minutes=5),
+                )
+                first = await worker.run_once(now)
+                self.assertEqual("success", first.status)
+                self.assertTrue(executor.refresh_targets)
+
+                executor.refresh_targets = None
+                second = await worker.run_once(now)
+                self.assertEqual("success", second.status)
+                self.assertFalse(executor.refresh_targets)
+            finally:
+                engine.dispose()
+
+    async def test_worker_persists_discovered_friends_from_a_run(self):
+        now = datetime(2026, 9, 22, 1, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            settings = _worker_settings(data_dir)
+            engine = create_engine(settings.database_url)
+            create_schema(engine)
+            try:
+                with Session(engine) as session:
+                    user = User(username="discovery-owner", password_hash="hash")
+                    session.add(user)
+                    session.flush()
+                    account = AccountService(
+                        session, CookieCipher(b"w" * 32), AuditService(session)
+                    ).create_from_storage_state(
+                        user.id, "扫码账号", _storage_state()
+                    )
+                    session.add(
+                        SparkTask(
+                            owner_user_id=user.id,
+                            douyin_account_id=account.id,
+                            target_name="好友",
+                            send_time="09:00",
+                            message_template="今日火花",
+                            enabled=True,
+                            next_run_at=now - timedelta(seconds=5),
+                        )
+                    )
+                    session.commit()
+                    account_id = account.id
+
+                executor = _RecordingExecutor(
+                    discovered_names=("Alp", "新加的好友"),
+                    discovered_identities=(
+                        DouyinUserIdentity(
+                            sec_uid="sec-alp", nickname="Alp", unique_id="alp001"
+                        ),
+                    ),
+                )
+                result = await Worker(
+                    settings,
+                    engine,
+                    executor=executor,
+                    started_at=now - timedelta(minutes=1),
+                ).run_once(now)
+
+                self.assertEqual("success", result.status)
+                with Session(engine) as session:
+                    names = set(
+                        session.scalars(select(DouyinConversation.display_name)).all()
+                    )
+                    self.assertEqual({"Alp", "新加的好友"}, names)
+                    identity = session.get(
+                        DouyinContactIdentity, (account_id, "sec-alp")
+                    )
+                    self.assertIsNotNone(identity)
+                    self.assertEqual("alp001", identity.unique_id)
             finally:
                 engine.dispose()
 

@@ -138,6 +138,35 @@ templates.env.filters["run_status"] = lambda value: RUN_STATUS_LABELS.get(value,
 templates.env.filters["run_stage"] = lambda value: RUN_STAGE_LABELS.get(value, value)
 
 
+def _snapshot_scanned_at(db, account_id: str) -> str | None:
+    """好友快照的最近一次采集时间（UTC ISO），给前端显示「新鲜度」。"""
+
+    newest = max(
+        (
+            value
+            for value in (
+                db.scalar(
+                    select(func.max(DouyinConversation.discovered_at)).where(
+                        DouyinConversation.account_id == account_id
+                    )
+                ),
+                db.scalar(
+                    select(func.max(DouyinContactIdentity.discovered_at)).where(
+                        DouyinContactIdentity.account_id == account_id
+                    )
+                ),
+            )
+            if value is not None
+        ),
+        default=None,
+    )
+    if newest is None:
+        return None
+    if newest.tzinfo is None:
+        newest = newest.replace(tzinfo=timezone.utc)
+    return newest.isoformat()
+
+
 def create_app(settings: Settings, engine: Engine) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
@@ -514,7 +543,10 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
                 for name in conversation_names
                 if name not in aliases
             )
-            return {"items": sorted(items, key=lambda item: item["name"])}
+            return {
+                "items": sorted(items, key=lambda item: item["name"]),
+                "scanned_at": _snapshot_scanned_at(db, account_id),
+            }
 
     @app.get("/tasks")
     def tasks_page(request: Request):

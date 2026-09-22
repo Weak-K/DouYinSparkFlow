@@ -8,7 +8,7 @@ import socket
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from spark_console.config import Settings
 from spark_console.crypto import CookieCipher
@@ -16,6 +16,7 @@ from spark_console.db import create_engine_for, create_schema, session_scope
 from spark_console.executor import DouyinExecutor
 from spark_console.models import (
     DouyinAccount,
+    DouyinConversation,
     SparkTask,
     SparkTaskTargetIdentity,
     TaskRun,
@@ -35,6 +36,8 @@ class Worker:
     STARTUP_GRACE = timedelta(minutes=5)
     RETRY_DELAYS = (timedelta(minutes=1), timedelta(minutes=5))
     EXECUTION_TIMEOUT_SECONDS = 180
+    # 好友快照超过这个时长就借下一次执行顺手刷新一次（每个账号每天最多一次）。
+    SNAPSHOT_MAX_AGE = timedelta(hours=20)
 
     def __init__(
         self,
@@ -45,6 +48,7 @@ class Worker:
         started_at: datetime | None = None,
         execution_timeout_seconds: float | None = None,
         mail_settings: MailSettings | None = None,
+        snapshot_max_age: timedelta | None = None,
     ):
         self.settings = settings
         self.engine = engine
@@ -56,6 +60,14 @@ class Worker:
             execution_timeout_seconds or self.EXECUTION_TIMEOUT_SECONDS
         )
         self.mail_settings = mail_settings or MailSettings.from_environ(os.environ)
+        self.snapshot_max_age = snapshot_max_age or timedelta(
+            hours=float(
+                os.environ.get(
+                    "SPARK_SNAPSHOT_MAX_AGE_HOURS",
+                    str(self.SNAPSHOT_MAX_AGE.total_seconds() / 3600),
+                )
+            )
+        )
         self.cipher = CookieCipher(settings.cookie_key_file.read_bytes())
         self._recover_interrupted_runs()
 
@@ -123,6 +135,8 @@ class Worker:
             target_identity = db.get(SparkTaskTargetIdentity, task.id)
             target_sec_uid = target_identity.sec_uid if target_identity else None
             cookies = account_service.decrypt_for_worker(task.douyin_account_id)
+            # 快照过期时借这次执行顺带把好友名单刷新一遍（不额外开浏览器）。
+            refresh_targets = self._snapshot_is_stale(db, account.id, current_time)
             run_id = run.id
             task_id = task.id
             account_id = account.id
@@ -139,6 +153,7 @@ class Worker:
                         message_template,
                         credential_version=credential_version,
                         target_sec_uid=target_sec_uid,
+                        refresh_targets=refresh_targets,
                     ),
                     timeout=self.execution_timeout_seconds,
                 )
@@ -202,9 +217,34 @@ class Worker:
                         result.error_summary,
                     )
                 )
+            if result is not None and (
+                result.discovered_names or result.discovered_identities
+            ):
+                try:
+                    AccountService(db, self.cipher, AuditService(db)).record_discovery(
+                        account_id,
+                        result.discovered_names,
+                        result.discovered_identities,
+                    )
+                except Exception:
+                    logger.warning("好友快照写回失败，已忽略以免影响本次执行结果")
         if alert is not None:
             await self._notify_cookie_expired(alert)
         return outcome
+
+    def _snapshot_is_stale(self, db, account_id: str, now: datetime) -> bool:
+        """好友快照是否该刷新了（没有任何快照也算过期）。"""
+
+        newest = db.scalar(
+            select(func.max(DouyinConversation.discovered_at)).where(
+                DouyinConversation.account_id == account_id
+            )
+        )
+        if newest is None:
+            return True
+        if newest.tzinfo is None:
+            newest = newest.replace(tzinfo=timezone.utc)
+        return now - newest > self.snapshot_max_age
 
     def _mark_cookie_invalid(
         self, db, account_id: str

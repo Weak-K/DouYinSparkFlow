@@ -13,6 +13,7 @@ from core.web_chat import (
     CONVERSATION_TITLE_SELECTOR,
     DouyinUserIdentity,
     UserInfoCollector,
+    collect_web_chat_conversation_names,
 )
 
 
@@ -673,22 +674,17 @@ class DouyinQrScanner:
 
     @staticmethod
     async def _visible_conversation_names(page) -> tuple[str, ...]:
-        names = []
-        seen = set()
+        """把整份会话列表滚完再快照。
+
+        老实现只读当时 DOM 里已有的行，而抖音左栏懒加载、首屏只渲染十来条，
+        于是好友名单长期停在十几条，靠下的好友永远选不到、也绑不上 sec_uid。
+        """
+
         try:
-            items = await page.locator(CONVERSATION_ITEM_SELECTOR).all()
-            for item in items:
-                if hasattr(item, "is_visible") and not await item.is_visible():
-                    continue
-                name = (
-                    await item.locator(CONVERSATION_TITLE_SELECTOR).inner_text()
-                ).strip()
-                if name and name not in seen:
-                    seen.add(name)
-                    names.append(name)
+            return await collect_web_chat_conversation_names(page, scroll=True)
         except Exception:
             logger.warning("auth scan could not snapshot visible conversations")
-        return tuple(names)
+            return ()
 
     @staticmethod
     async def _required_text(page, selector: str) -> str:

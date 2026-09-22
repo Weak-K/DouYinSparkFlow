@@ -1,9 +1,12 @@
 import unittest
 
 from core.web_chat import (
+    CONVERSATION_LIST_SELECTOR,
     TargetNotFoundError,
     UserInfoCollector,
+    collect_web_chat_conversation_names,
     list_visible_web_chat_targets,
+    normalize_target_name,
     select_web_chat_target,
 )
 
@@ -358,6 +361,108 @@ class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
             await select_web_chat_target(page, "ʚ繁花ɞ🌸")
 
         self.assertFalse(page.items[0].clicked)
+
+
+class FakeScrollContainer:
+    def __init__(self, conversation_list):
+        self.conversation_list = conversation_list
+
+    async def count(self):
+        return 1
+
+    @property
+    def first(self):
+        return self
+
+    async def evaluate(self, _script):
+        self.conversation_list.reveal_next_batch()
+
+
+class FakeLazyConversationList:
+    """模拟抖音左栏：滚到底才渲染下一屏。"""
+
+    def __init__(self, batches):
+        self.batches = [list(batch) for batch in batches]
+        self.revealed = 1
+
+    def reveal_next_batch(self):
+        if self.revealed < len(self.batches):
+            self.revealed += 1
+
+    async def all(self):
+        return [
+            FakeConversation(title)
+            for batch in self.batches[: self.revealed]
+            for title in batch
+        ]
+
+
+class FakeScrollingPage:
+    def __init__(self, batches):
+        self.conversations = FakeLazyConversationList(batches)
+
+    async def wait_for_selector(self, _selector, *, timeout):
+        return None
+
+    async def wait_for_timeout(self, _milliseconds):
+        return None
+
+    def locator(self, selector):
+        if selector == CONVERSATION_LIST_SELECTOR:
+            return FakeScrollContainer(self.conversations)
+        return self.conversations
+
+
+class WebChatNameNormalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matches_a_name_that_differs_only_by_invisible_characters(self):
+        page = FakeWebChatPage(["punk\xa0LeeLii", "别人"])
+
+        selected = await select_web_chat_target(page, "punk LeeLii")
+
+        self.assertEqual("punk\xa0LeeLii", selected)
+        self.assertTrue(page.items[0].clicked)
+        self.assertFalse(page.items[1].clicked)
+
+    async def test_never_matches_a_differently_cased_name(self):
+        page = FakeWebChatPage(["alp"])
+
+        with self.assertRaises(TargetNotFoundError):
+            await select_web_chat_target(page, "Alp")
+
+    async def test_normalization_only_folds_invisible_differences(self):
+        self.assertEqual("Alp", normalize_target_name("  Alp\u200b "))
+        self.assertEqual("punk LeeLii", normalize_target_name("punk\xa0LeeLii"))
+        self.assertNotEqual(
+            normalize_target_name("Alp"), normalize_target_name("alp")
+        )
+
+
+class WebChatSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scrolling_reveals_the_whole_conversation_list(self):
+        page = FakeScrollingPage([["第一位好友", "Alp"], ["更早的好友"], ["最早的好友"]])
+
+        names = await collect_web_chat_conversation_names(page)
+
+        self.assertEqual(("第一位好友", "Alp", "更早的好友", "最早的好友"), names)
+
+    async def test_selection_can_reach_a_friend_from_a_later_screen(self):
+        page = FakeScrollingPage([["最近的好友"], ["沉到下面的 Alp"]])
+
+        discovered = []
+        selected = await select_web_chat_target(
+            page, "沉到下面的 Alp", scroll=True, discovered=discovered
+        )
+
+        self.assertEqual("沉到下面的 Alp", selected)
+        self.assertIn("最近的好友", discovered)
+
+    async def test_reports_every_name_it_saw_for_the_snapshot(self):
+        page = FakeScrollingPage([["甲", "乙"]])
+
+        discovered = []
+        await select_web_chat_target(page, "乙", discovered=discovered)
+
+        self.assertEqual(["甲", "乙"], discovered)
 
 
 if __name__ == "__main__":

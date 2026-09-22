@@ -149,6 +149,90 @@ class AccountService:
             for item in accounts
         ]
 
+    def record_discovery(
+        self,
+        account_id: str,
+        conversation_names=(),
+        contact_identities=(),
+    ) -> int:
+        """把一次真实执行中看到的好友名单并回快照表（只增不删）。
+
+        控制台的任务下拉框完全依赖这张快照，而老实现只在扫码登录那一刻拍一张
+        首屏快照，之后永不更新——好友改名、新人加进来都看不见。这里做 upsert：
+        新名字补进来，老名字只刷新 discovered_at，绝不删除（删了会连用户已绑定的
+        选项一起丢）。
+        """
+
+        account = self.session.get(DouyinAccount, account_id)
+        if account is None:
+            return 0
+        now = utc_now()
+        written = 0
+        known = set(
+            self.session.scalars(
+                select(DouyinConversation.display_name).where(
+                    DouyinConversation.account_id == account_id
+                )
+            ).all()
+        )
+        for display_name in conversation_names:
+            normalized_name = str(display_name).strip()[:256]
+            if not normalized_name:
+                continue
+            if normalized_name in known:
+                self.session.execute(
+                    update(DouyinConversation)
+                    .where(
+                        DouyinConversation.account_id == account_id,
+                        DouyinConversation.display_name == normalized_name,
+                    )
+                    .values(discovered_at=now)
+                )
+            else:
+                known.add(normalized_name)
+                self.session.add(
+                    DouyinConversation(
+                        account_id=account_id, display_name=normalized_name
+                    )
+                )
+            written += 1
+
+        seen_sec_uids = set()
+        for identity in contact_identities:
+            sec_uid = str(getattr(identity, "sec_uid", "") or "").strip()[:256]
+            if not sec_uid or sec_uid in seen_sec_uids:
+                continue
+            seen_sec_uids.add(sec_uid)
+            row = self.session.get(DouyinContactIdentity, (account_id, sec_uid))
+            if row is None:
+                self.session.add(
+                    DouyinContactIdentity(
+                        account_id=account_id,
+                        sec_uid=sec_uid,
+                        short_id=_limited(getattr(identity, "short_id", None), 64),
+                        unique_id=_limited(getattr(identity, "unique_id", None), 128),
+                        nickname=_limited(getattr(identity, "nickname", None), 256),
+                        remark_name=_limited(
+                            getattr(identity, "remark_name", None), 256
+                        ),
+                    )
+                )
+            else:
+                # 用非空值覆盖，别让一次没带昵称的响应把已知信息抹掉。
+                for field, length in (
+                    ("short_id", 64),
+                    ("unique_id", 128),
+                    ("nickname", 256),
+                    ("remark_name", 256),
+                ):
+                    value = _limited(getattr(identity, field, None), length)
+                    if value:
+                        setattr(row, field, value)
+                row.discovered_at = now
+            written += 1
+        self.session.flush()
+        return written
+
     def decrypt_for_worker(self, account_id: str) -> bytearray:
         account = self.session.get(DouyinAccount, account_id)
         if account is None:

@@ -352,18 +352,19 @@ class UserWebTests(unittest.TestCase):
         response = self.client.get(f"/accounts/{account_id}/conversations")
 
         self.assertEqual(200, response.status_code)
+        body = response.json()
         self.assertEqual(
-            {
-                "items": [
-                    {"name": "gsy", "sec_uid": None},
-                    {"name": "我的备注", "sec_uid": "stable-user-id"},
-                ]
-            },
-            response.json(),
+            [
+                {"name": "gsy", "sec_uid": None},
+                {"name": "我的备注", "sec_uid": "stable-user-id"},
+            ],
+            body["items"],
         )
+        # 好友名单来自快照，前端要能显示它是何时更新的。
+        self.assertTrue(body["scanned_at"])
         self.assertIn('list="task-target-options"', tasks_page.text)
         self.assertIn('name="target_sec_uid"', tasks_page.text)
-        self.assertIn("读取好友列表", tasks_page.text)
+        self.assertIn("重读已保存名单", tasks_page.text)
         self.assertNotIn("secret-marker", response.text)
 
     def test_new_task_binds_selected_stable_contact_identity(self):

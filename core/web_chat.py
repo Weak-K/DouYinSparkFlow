@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import urlparse
@@ -11,13 +12,36 @@ from utils.logger import setup_logger
 WEB_CHAT_URL = "https://www.douyin.com/chat"
 CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
+CONVERSATION_LIST_SELECTOR = ".conversationConversationListwrapper"
 CHAT_EDITOR_SELECTOR = ".messageEditorimChatEditorContainer"
 SEARCH_INPUT_SELECTORS = (
     'input[placeholder="搜索"]',
     'input[placeholder*="搜索"]',
 )
 
+# 零宽字符在页面上看不见，却会让 `==` 失配（历史上出现过 \u00a0 与普通空格并存）。
+_INVISIBLE_CHARACTERS = dict.fromkeys(
+    map(ord, "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff"), None
+)
+
+CONVERSATION_SCROLL_MAX_ITEMS = 300
+# 滚动刷新好友快照的硬预算：宁可少读几个，也不能把任务的 180 秒执行超时顶掉。
+CONVERSATION_SCROLL_BUDGET_SECONDS = 20.0
+
 logger = setup_logger(level=logging.DEBUG)
+
+
+def normalize_target_name(value) -> str:
+    """把「人眼无法区分、但字符串比较会失配」的差异折叠掉。
+
+    只做字符层的宽松化（NFKC + 去掉零宽字符 + 空白折叠），**不做大小写折叠**：
+    匹配失败是安全失败，误发到另一个人才是事故。
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = text.translate(_INVISIBLE_CHARACTERS)
+    # str.split() 会把 \xa0 / \u3000 等一并当空白处理。
+    return " ".join(text.split())
 
 
 @dataclass(frozen=True)
@@ -126,6 +150,96 @@ async def list_visible_web_chat_targets(page, timeout=30000):
     return targets
 
 
+@dataclass(frozen=True)
+class ConversationRow:
+    title: str
+    locator: object
+
+
+async def _scroll_conversation_list(page, last_row) -> bool:
+    """把左侧会话列表往下推一屏；无法滚动时返回 False 让调用方收工。"""
+
+    try:
+        container = page.locator(CONVERSATION_LIST_SELECTOR)
+        if await container.count() > 0:
+            await container.first.evaluate(
+                "(element) => { element.scrollTop = element.scrollHeight; }"
+            )
+        elif last_row is not None:
+            await last_row.scroll_into_view_if_needed()
+        else:
+            return False
+    except Exception:
+        return False
+    try:
+        await page.wait_for_timeout(600)
+    except Exception:
+        pass
+    return True
+
+
+async def _conversation_rows(
+    page,
+    *,
+    scroll: bool = False,
+    max_items: int = CONVERSATION_SCROLL_MAX_ITEMS,
+    budget_seconds: float = CONVERSATION_SCROLL_BUDGET_SECONDS,
+) -> list[ConversationRow]:
+    """读出会话列表；`scroll=True` 时一直往下滚到不再新增为止。
+
+    抖音左栏是懒加载的，登录那一刻只渲染首屏十来条——这正是控制台好友列表
+    只有十几条的根因。滚动会拉长执行时间，所以只有需要刷新快照时才打开，
+    而且有「条数上限 + 秒数预算」两道闸，超了就拿已读到的部分收工。
+    这里不等待列表出现（列表尚未渲染时返回空列表），等待由调用方负责。
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_seconds
+    collected: dict[str, ConversationRow] = {}
+    idle_rounds = 0
+    while True:
+        before = len(collected)
+        items = await page.locator(CONVERSATION_ITEM_SELECTOR).all()
+        visible_items = []
+        for item in items:
+            if hasattr(item, "is_visible") and not await item.is_visible():
+                continue
+            visible_items.append(item)
+            title = (
+                await item.locator(CONVERSATION_TITLE_SELECTOR).inner_text()
+            ).strip()
+            if title and title not in collected:
+                collected[title] = ConversationRow(title, item)
+        if not scroll or len(collected) >= max_items or loop.time() >= deadline:
+            break
+        if len(collected) == before:
+            idle_rounds += 1
+        else:
+            idle_rounds = 0
+        if idle_rounds >= 2:
+            break
+        if not await _scroll_conversation_list(
+            page, visible_items[-1] if visible_items else None
+        ):
+            break
+    return list(collected.values())
+
+
+async def collect_web_chat_conversation_names(
+    page,
+    *,
+    scroll: bool = True,
+    max_items: int = CONVERSATION_SCROLL_MAX_ITEMS,
+    budget_seconds: float = CONVERSATION_SCROLL_BUDGET_SECONDS,
+) -> tuple[str, ...]:
+    """返回会话列表里全部（尽可能多）的显示名，用于刷新好友快照。"""
+
+    rows = await _conversation_rows(
+        page, scroll=scroll, max_items=max_items, budget_seconds=budget_seconds
+    )
+    return tuple(row.title for row in rows)
+
+
 async def _click_search_result(result) -> None:
     try:
         send_button = result.locator(
@@ -161,24 +275,39 @@ async def _wait_for_visible_search_results(page, candidate, timeout_ms):
         await asyncio.sleep(min(0.2, remaining))
 
 
-async def select_web_chat_target(page, target, timeout=30000, aliases=()):
-    """Select one exact target, preferring real conversation rows over page text."""
+async def select_web_chat_target(
+    page, target, timeout=30000, aliases=(), scroll=False, discovered=None
+):
+    """Select one exact target, preferring real conversation rows over page text.
+
+    `scroll=True` 时先把左侧会话列表滚动加载完整再匹配（首屏只有十来条，
+    更靠下的好友根本扫不到）。`discovered` 是可选的列表出参：把本次真正看到的
+    会话显示名写回去，调用方据此刷新好友快照。
+    """
+
     normalized_target = target.strip()
-    candidates = tuple(
+    raw_candidates = tuple(
         dict.fromkeys(
             value.strip() for value in (*aliases, normalized_target) if value and value.strip()
         )
     )
+    folded_candidates = {
+        normalize_target_name(value): value for value in raw_candidates
+    }
 
-    for item in await page.locator(CONVERSATION_ITEM_SELECTOR).all():
-        if hasattr(item, "is_visible") and not await item.is_visible():
-            continue
-        title = (
-            await item.locator(CONVERSATION_TITLE_SELECTOR).inner_text()
-        ).strip()
-        if title in candidates:
-            await item.click()
-            return title
+    def remember(rows):
+        if discovered is None:
+            return
+        for row in rows:
+            if row.title and row.title not in discovered:
+                discovered.append(row.title)
+
+    rows = await _conversation_rows(page, scroll=scroll)
+    remember(rows)
+    for row in rows:
+        if row.title in raw_candidates:
+            await row.locator.click()
+            return row.title
 
     for selector in SEARCH_INPUT_SELECTORS:
         try:
@@ -186,7 +315,7 @@ async def select_web_chat_target(page, target, timeout=30000, aliases=()):
             if await search.count() == 0:
                 continue
             field = search.first
-            for candidate in candidates:
+            for candidate in raw_candidates:
                 await field.fill(candidate)
                 results = await _wait_for_visible_search_results(
                     page, candidate, timeout
@@ -200,15 +329,25 @@ async def select_web_chat_target(page, target, timeout=30000, aliases=()):
 
     await page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=timeout)
 
-    for item in await page.locator(CONVERSATION_ITEM_SELECTOR).all():
-        if hasattr(item, "is_visible") and not await item.is_visible():
-            continue
-        title = (
-            await item.locator(CONVERSATION_TITLE_SELECTOR).inner_text()
-        ).strip()
-        if title in candidates:
-            await item.click()
-            return title
+    known = {row.title for row in rows}
+    retry_rows = await _conversation_rows(page, scroll=False)
+    remember(retry_rows)
+    for row in retry_rows:
+        if row.title not in known:
+            known.add(row.title)
+            rows.append(row)
+
+    for row in rows:
+        if row.title in raw_candidates:
+            await row.locator.click()
+            return row.title
+
+    # 精确名全没命中时，只放宽「零宽字符/空白差异」，绝不放宽大小写，
+    # 免得把消息发给另一个同名不同大小写的人。
+    for row in rows:
+        if normalize_target_name(row.title) in folded_candidates:
+            await row.locator.click()
+            return row.title
 
     raise TargetNotFoundError(f"未在抖音聊天列表中找到好友 {normalized_target}")
 
