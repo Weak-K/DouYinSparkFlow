@@ -269,6 +269,53 @@ class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(page.results.checks, 3)
         self.assertTrue(page.results.item.clicked)
 
+    async def test_retries_a_cold_search_panel_that_returns_nothing(self):
+        """页面加载后的第一次搜索常常不出结果；清空重搜一轮必须能挽回。"""
+
+        class SearchField:
+            def __init__(self):
+                self.first = self
+                self.fills = []
+
+            async def count(self):
+                return 1
+
+            async def fill(self, value):
+                self.fills.append(value)
+
+        class Results:
+            def __init__(self, field):
+                self.field = field
+                self.item = FakeConversation("一一")
+
+            async def count(self):
+                # 只有「真的搜过 → 清空 → 再搜一次」之后，面板才给出结果
+                return 1 if self.field.fills.count("一一") >= 2 else 0
+
+            async def all(self):
+                return [self.item]
+
+        class Page:
+            def __init__(self):
+                self.search = SearchField()
+                self.results = Results(self.search)
+
+            def locator(self, selector):
+                if selector == ".conversationConversationItemwrapper":
+                    return FakeConversationList([])
+                return self.search
+
+            def get_by_text(self, _text, exact):
+                return self.results
+
+        page = Page()
+
+        selected = await select_web_chat_target(page, "一一", timeout=300)
+
+        self.assertEqual("一一", selected)
+        self.assertTrue(page.results.item.clicked)
+        self.assertEqual(["一一", "", "一一"], page.search.fills)
+
     async def test_ignores_hidden_duplicate_and_clicks_visible_conversation(self):
         page = FakeWebChatPage(
             ["ʚ繁花ɞ🌸", "ʚ繁花ɞ🌸"],

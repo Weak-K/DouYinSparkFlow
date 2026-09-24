@@ -28,6 +28,11 @@ CONVERSATION_SCROLL_MAX_ITEMS = 300
 # 滚动刷新好友快照的硬预算：宁可少读几个，也不能把任务的 180 秒执行超时顶掉。
 CONVERSATION_SCROLL_BUDGET_SECONDS = 20.0
 
+# 搜索面板冷启动：同一个页面上的第一次输入常常不出结果，清空重搜一轮即可恢复。
+# （2026-09-24 线上实测：第一次 fill 等满 3 秒仍是 0 条，紧接着的第二次 0.5 秒就出。）
+SEARCH_COLD_START_RETRIES = 1
+SEARCH_COLD_START_SETTLE_SECONDS = 0.3
+
 logger = setup_logger(level=logging.DEBUG)
 
 
@@ -275,6 +280,31 @@ async def _wait_for_visible_search_results(page, candidate, timeout_ms):
         await asyncio.sleep(min(0.2, remaining))
 
 
+async def _search_in_panel(page, field, candidate, timeout_ms):
+    """在搜索框里搜一个候选，返回可见的精确文本结果（可能为空列表）。
+
+    抖音搜索面板存在**冷启动不出结果**的行为：同一个页面上的第一次输入，结果
+    列表一直是空的（线上实测等满 3 秒仍为 0 条），紧接着的第二次输入 0.5 秒就
+    出结果。控制台每条任务都新起一个浏览器，于是「每条任务的第一次搜索」必然
+    撞上这个行为 —— 凡是不在左侧会话列表里的好友都会被误判成「找不到目标」。
+
+    这里用「清空后重搜一轮」把冷启动那一跳让过去。第一次就出结果时不会多花时间。
+    """
+
+    for attempt in range(SEARCH_COLD_START_RETRIES + 1):
+        if attempt:
+            try:
+                await field.fill("")
+            except (AttributeError, TypeError):
+                pass
+            await asyncio.sleep(SEARCH_COLD_START_SETTLE_SECONDS)
+        await field.fill(candidate)
+        results = await _wait_for_visible_search_results(page, candidate, timeout_ms)
+        if results:
+            return results
+    return []
+
+
 async def select_web_chat_target(
     page, target, timeout=30000, aliases=(), scroll=False, discovered=None
 ):
@@ -316,10 +346,7 @@ async def select_web_chat_target(
                 continue
             field = search.first
             for candidate in raw_candidates:
-                await field.fill(candidate)
-                results = await _wait_for_visible_search_results(
-                    page, candidate, timeout
-                )
+                results = await _search_in_panel(page, field, candidate, timeout)
                 for result in results:
                     await _click_search_result(result)
                     return candidate
