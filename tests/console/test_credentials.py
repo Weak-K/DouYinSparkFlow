@@ -437,14 +437,34 @@ class _FakeEditor:
         self.pressed.append(key)
 
 
+class _FakeHeader:
+    """聊天区顶部的会话标题，供发送前校验读取。"""
+
+    def __init__(self, title):
+        self.title = title
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self):
+        return 1
+
+    async def inner_text(self):
+        return self.title
+
+
 class _FakeSendingPage(_FakePage):
-    def __init__(self):
+    def __init__(self, opened_title="目标"):
         self.editor = _FakeEditor()
+        self.header = _FakeHeader(opened_title)
 
     async def wait_for_selector(self, *_args, **_kwargs):
         return None
 
-    def locator(self, _selector):
+    def locator(self, selector):
+        if "RightPanelHeadertitle" in selector:
+            return self.header
         return self.editor
 
 
@@ -455,7 +475,7 @@ class _FakeConversationNotOpenedPage(_FakePage):
 
 class _FakeIdentityPage(_FakeSendingPage):
     def __init__(self):
-        super().__init__()
+        super().__init__(opened_title="我的备注")
         self.response_callback = None
 
     def on(self, event, callback):
@@ -684,6 +704,44 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("conversation_not_opened", result.error_code)
         self.assertEqual("已找到好友，但聊天窗口没有打开", result.error_summary)
         self.assertTrue(result.retryable)
+
+    async def test_executor_refuses_when_a_different_conversation_is_open(self):
+        """发送前校验：打开的会话不是目标本人 → 一票否决，一个字都不输入。"""
+
+        page = _FakeSendingPage(opened_title="别人")
+        browser = _FakeBrowser()
+
+        async def new_page():
+            return page
+
+        browser.context.new_page = new_page
+        async_api = ModuleType("playwright.async_api")
+        async_api.async_playwright = lambda: _FakePlaywrightManager(browser)
+        playwright = ModuleType("playwright")
+        playwright.async_api = async_api
+        core_tasks = ModuleType("core.tasks")
+        core_tasks.confirm_message_sent = lambda *_args, **_kwargs: None
+
+        async def select_target(*_args, **_kwargs):
+            return "目标"
+
+        raw = b'[{"name":"sid","value":"wrong-conversation-marker","domain":".douyin.com","path":"/"}]'
+        with patch.dict(
+            "sys.modules",
+            {
+                "playwright": playwright,
+                "playwright.async_api": async_api,
+                "core.tasks": core_tasks,
+            },
+        ), patch("spark_console.executor.select_web_chat_target", select_target):
+            result = await DouyinExecutor().execute(raw, "目标", "消息")
+
+        self.assertEqual([], page.editor.pressed)
+        self.assertFalse(result.success)
+        self.assertEqual("selecting_target", result.stage)
+        self.assertEqual("wrong_conversation_opened", result.error_code)
+        # 不重试：重试只会再发错一次
+        self.assertFalse(result.retryable)
 
     async def test_executor_resolves_current_alias_from_stable_identity(self):
         page = _FakeIdentityPage()
