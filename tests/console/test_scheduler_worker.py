@@ -718,6 +718,12 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
                 )
                 first = await worker.run_once(now)
                 self.assertEqual("retry_scheduled_1m", first.error_code)
+                # 收尾时间必须取「真实此刻」而不是 claim 时间：否则
+                # started_at == finished_at，本次实际卡了多久就查不出来了。
+                self.assertGreater(
+                    first.finished_at.replace(tzinfo=timezone.utc),
+                    first.started_at.replace(tzinfo=timezone.utc),
+                )
                 with Session(engine) as session:
                     self.assertEqual(
                         now + timedelta(minutes=1),

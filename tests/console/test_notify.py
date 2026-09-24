@@ -234,6 +234,46 @@ class TaskFailureAlertTests(unittest.TestCase):
         self.assertFalse(sent)
         dispatcher.assert_not_called()
 
+    def test_scheduled_retries_are_not_alerted(self):
+        """「已安排自动重试」只是中间态，不该发全局告警，也不该占用冷却窗口。"""
+
+        with patch("spark_console.notify._send_async") as dispatcher:
+            one_minute = alert_task_failure(
+                stage="selecting_target",
+                error_code="retry_scheduled_1m",
+                error_summary="发送前遇到临时故障，已安排 1 分钟后重试",
+                task_id="task-1",
+                settings=self.settings,
+            )
+            five_minutes = alert_task_failure(
+                stage="selecting_target",
+                error_code="retry_scheduled_5m",
+                settings=self.settings,
+            )
+
+        self.assertFalse(one_minute)
+        self.assertFalse(five_minutes)
+        dispatcher.assert_not_called()
+        # 没有任何状态写入 → 重试不会把冷却窗口烧掉，真正失败时仍能立刻告警
+        self.assertFalse((Path(self.temp.name) / "alert-state.json").exists())
+
+    def test_final_failure_after_retries_still_alerts(self):
+        """重试机会用尽后的最终失败必须照发，别被上面的过滤误伤。"""
+
+        with patch("spark_console.notify._send_async") as dispatcher:
+            sent = alert_task_failure(
+                stage="selecting_target",
+                error_code="conversation_not_opened",
+                error_summary="已找到好友，但聊天窗口没有打开",
+                task_id="6fb1ff75-be90-4000-a054-5745a1204b03",
+                settings=self.settings,
+            )
+
+        self.assertTrue(sent)
+        body = dispatcher.call_args.args[3]
+        self.assertIn("conversation_not_opened", body)
+        self.assertIn("6fb1ff75-be90-4000-a054-5745a1204b03", body)
+
     def test_other_failures_notify_ops_recipients(self):
         with patch("spark_console.notify._send_async") as dispatcher:
             sent = alert_task_failure(

@@ -320,11 +320,13 @@ class Worker:
                 continue
             minutes = int(delay.total_seconds() // 60)
             task.next_run_at = now + delay
+            # 收尾时间必须取「此刻」而不是本轮 claim 的时间：否则 run 的
+            # started_at == finished_at，把本次实际卡了多久抹成 0，事后无法定位。
             return finish_run(
                 run,
                 "failed",
                 stage,
-                now,
+                datetime.now(timezone.utc),
                 code,
                 f"发送前遇到临时故障，已安排 {minutes} 分钟后重试",
             )

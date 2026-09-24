@@ -9,7 +9,8 @@
   （收件人取 `users.email`）。每个控制台账号名下的抖音号不同，所以不做全局群发；
   该用户尚未填写邮箱时，兜底发给 `SPARK_ALERT_EMAIL_TO`，避免旧账号静默漏提醒。
 - `alert_task_failure()`：其他任务失败时通知运维收件人，带**冷却窗口**（默认 60 分钟）
-  且在**守护线程**里发送，不阻塞调用方事务；`cookie_invalid` 不走这条路。
+  且在**守护线程**里发送，不阻塞调用方事务。两类失败不走这条路：`cookie_invalid`
+  （已按用户发给本人）和 `retry_scheduled_*`（只是「已安排自动重试」的中间态，不是最终失败）。
 
 环境变量（写在 .env.console）
     SPARK_SMTP_HOST / _PORT / _SECURITY / _USER / _PASSWORD / _FROM
@@ -50,6 +51,11 @@ COOKIE_RELATED_CODES = {"cookie_invalid", "conversation_not_opened", "target_not
 
 # 已由「按用户」的失效提醒覆盖，全局告警不再重复发
 USER_SCOPED_CODES = {"cookie_invalid"}
+
+# `retry_scheduled_<n>m` 是 Worker 自己安排的自动重试，属于中间态而非最终失败：
+# 它一定还会再试一次，此时发告警只会把正常重试变成误报噪音。
+# （2026-09-24 线上实测：一次临时故障就会发出一封「任务失败：retry_scheduled_1m」。）
+RETRY_SCHEDULED_PREFIX = "retry_scheduled"
 
 
 def parse_recipients(raw: str) -> tuple[str, ...]:
@@ -223,7 +229,7 @@ def _write_state(settings: MailSettings, state: dict) -> None:
 
 
 def _build_failure_body(
-    stage: str, error_code: str, error_summary: str, suppressed: int
+    stage: str, error_code: str, error_summary: str, suppressed: int, task_id: str = ""
 ) -> str:
     lines = [
         "抖音火花控制台：任务执行失败",
@@ -233,6 +239,8 @@ def _build_failure_body(
         f"错误码：{error_code or '未提供'}",
         f"摘要：{error_summary or '无'}",
     ]
+    if task_id:
+        lines.append(f"任务：{task_id}")
     if error_code in COOKIE_RELATED_CODES:
         lines += [
             "",
@@ -259,16 +267,23 @@ def alert_task_failure(
     stage: str = "",
     error_code: str = "",
     error_summary: str = "",
+    task_id: str = "",
     settings: MailSettings | None = None,
 ) -> bool:
     """任务失败的全局兜底告警：带冷却窗口、异步发送。任何异常都不向上冒泡。
 
-    `cookie_invalid` 不在这里发——它由 Worker 按用户发给该号归属人，
-    再走一遍全局收件人只会重复打扰。
+    两类失败不在这里发：
+
+    - `cookie_invalid`：由 Worker 按用户发给该号归属人，再走一遍全局收件人只会重复打扰。
+    - `retry_scheduled_*`：Worker 已自行安排了 1 分钟 / 5 分钟的重试，这是中间态；
+      此时告警会把「正常的自动重试」变成误报。真正重试完仍失败时，最后那次
+      会带真实错误码走到这里，该发的告警一封都不会少。
     """
 
     try:
         if error_code in USER_SCOPED_CODES:
+            return False
+        if error_code.startswith(RETRY_SCHEDULED_PREFIX):
             return False
         settings = settings or MailSettings.from_environ(os.environ)
         if not settings.configured or not settings.alert_recipients:
@@ -297,7 +312,7 @@ def alert_task_failure(
             return False
 
         subject = f"【火花控制台】任务失败：{error_code or stage or '未知原因'}"
-        body = _build_failure_body(stage, error_code, error_summary, suppressed)
+        body = _build_failure_body(stage, error_code, error_summary, suppressed, task_id)
         state["last_sent_at"] = now.isoformat()
         state["suppressed"] = 0
         _write_state(settings, state)
