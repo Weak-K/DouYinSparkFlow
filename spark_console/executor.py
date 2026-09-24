@@ -9,6 +9,8 @@ from core.web_chat import (
     WEB_CHAT_URL,
     TargetNotFoundError,
     UserInfoCollector,
+    matches_opened_conversation,
+    opened_conversation_title,
     select_web_chat_target,
 )
 from spark_console.credentials import CredentialError, CredentialPayload
@@ -97,6 +99,21 @@ class DouyinExecutor:
                         discovered=discovered,
                     )
                     await page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=30000)
+                    # 发送前必须确认打开的就是目标本人。选人链路（搜索面板的结果、
+                    # 虚拟滚动里被复用的会话行）都可能把别的会话选中，而消息一旦
+                    # 发出去就撤不回来 —— 这里宁可安全失败也不赌。
+                    opened = await opened_conversation_title(page)
+                    if not matches_opened_conversation(opened, (target, *aliases)):
+                        logger.warning(
+                            "opened conversation does not match the target stage=selecting_target"
+                        )
+                        return ExecutionResult(
+                            False,
+                            ExecutionStage.SELECTING_TARGET,
+                            "wrong_conversation_opened",
+                            "打开的会话与目标不一致，已中止发送",
+                            discovered_names=tuple(discovered),
+                        )
                     stage = ExecutionStage.SENDING
                     editor = page.locator(CHAT_EDITOR_SELECTOR).first
                     lines = message.splitlines() or [message]

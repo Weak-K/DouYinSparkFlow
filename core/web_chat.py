@@ -14,6 +14,8 @@ CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
 CONVERSATION_LIST_SELECTOR = ".conversationConversationListwrapper"
 CHAT_EDITOR_SELECTOR = ".messageEditorimChatEditorContainer"
+# 聊天区顶部「当前打开的会话」标题（发送前校验的依据）
+CONVERSATION_HEADER_SELECTOR = ".RightPanelHeadertitle"
 SEARCH_INPUT_SELECTORS = (
     'input[placeholder="搜索"]',
     'input[placeholder*="搜索"]',
@@ -303,6 +305,34 @@ async def _search_in_panel(page, field, candidate, timeout_ms):
         if results:
             return results
     return []
+
+
+async def opened_conversation_title(page) -> str:
+    """读聊天区顶部「当前打开的会话」标题；读不到时返回空串。
+
+    这是发送前最后一道校验的依据。选人链路（搜索面板的结果、虚拟滚动复用的
+    会话行）都存在选错的可能，而消息一旦发出去就撤不回来 —— 宁可认成「读不到」
+    让调用方安全失败，也不能默认放行。
+    """
+
+    try:
+        locator = page.locator(CONVERSATION_HEADER_SELECTOR)
+        if await locator.count() == 0:
+            return ""
+        return (await locator.first.inner_text()).strip()
+    except Exception:  # noqa: BLE001 —— 校验读取失败一律按「读不到」处理
+        return ""
+
+
+def matches_opened_conversation(opened_title: str, candidates) -> bool:
+    """打开的会话标题是否就是候选之一（用与选人一致的归一化规则比对）。"""
+
+    opened = normalize_target_name(opened_title)
+    if not opened:
+        return False
+    return any(
+        opened == normalize_target_name(value) for value in candidates if value
+    )
 
 
 async def select_web_chat_target(

@@ -6,6 +6,7 @@ from core.web_chat import (
     UserInfoCollector,
     collect_web_chat_conversation_names,
     list_visible_web_chat_targets,
+    matches_opened_conversation,
     normalize_target_name,
     select_web_chat_target,
 )
@@ -461,6 +462,19 @@ class FakeScrollingPage:
 
 
 class WebChatNameNormalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_sends_when_the_opened_conversation_is_the_target(self):
+        """发送前的标题校验：打开的必须是目标本人或它的别名，否则一律拒绝。"""
+
+        self.assertTrue(matches_opened_conversation("我是妹妹", ("我是妹妹", "kwkooy")))
+        self.assertTrue(matches_opened_conversation("kwkooy", ("我是妹妹", "kwkooy")))
+        # 归一化：零宽字符 / 空白差异不算换人
+        self.assertTrue(matches_opened_conversation("punk\xa0LeeLii", ("punk LeeLii",)))
+        # 打开的是别人 → 必须拒绝（这就是「消息发错人」的兜底）
+        self.assertFalse(matches_opened_conversation("鸡蛋面", ("我是妹妹", "kwkooy")))
+        # 读不到标题、候选为空 → 安全失败
+        self.assertFalse(matches_opened_conversation("", ("我是妹妹",)))
+        self.assertFalse(matches_opened_conversation("我是妹妹", ()))
+
     async def test_matches_a_name_that_differs_only_by_invisible_characters(self):
         page = FakeWebChatPage(["punk\xa0LeeLii", "别人"])
 
