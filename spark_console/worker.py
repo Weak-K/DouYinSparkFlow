@@ -134,6 +134,12 @@ class Worker:
             credential_version = account.cookie_version
             target_identity = db.get(SparkTaskTargetIdentity, task.id)
             target_sec_uid = target_identity.sec_uid if target_identity else None
+            # 目标不在会话列表里时页面不会返回它的身份，别名只能从库里取历史记录兜底。
+            target_aliases = (
+                account_service.identity_aliases(account.id, target_sec_uid)
+                if target_sec_uid
+                else ()
+            )
             cookies = account_service.decrypt_for_worker(task.douyin_account_id)
             # 快照过期时借这次执行顺带把好友名单刷新一遍（不额外开浏览器）。
             refresh_targets = self._snapshot_is_stale(db, account.id, current_time)
@@ -154,6 +160,7 @@ class Worker:
                         credential_version=credential_version,
                         target_sec_uid=target_sec_uid,
                         refresh_targets=refresh_targets,
+                        target_aliases=target_aliases,
                     ),
                     timeout=self.execution_timeout_seconds,
                 )

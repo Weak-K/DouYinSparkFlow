@@ -49,6 +49,7 @@ class DouyinExecutor:
         credential_version: int = 1,
         target_sec_uid: str | None = None,
         refresh_targets: bool = False,
+        target_aliases: tuple[str, ...] = (),
     ) -> ExecutionResult:
         from playwright.async_api import async_playwright
         from core.tasks import confirm_message_sent
@@ -78,11 +79,20 @@ class DouyinExecutor:
                         if target_sec_uid
                         else None
                     )
+                    # 页面只会为「已经在会话列表里的会话」请求 user/info，不在列表里的
+                    # 目标永远抓不到别名 —— 而恰恰只有这类目标要靠别名去搜索。
+                    # 所以与库里存的历史身份（worker 查好传进来）合并，别让兜底落空，
+                    # 这样对方改了昵称也还能用抖音号搜到。
+                    aliases = tuple(
+                        dict.fromkeys(
+                            (*(identity.aliases if identity else ()), *target_aliases)
+                        )
+                    )
                     await select_web_chat_target(
                         page,
                         target,
                         timeout=45000,
-                        aliases=identity.aliases if identity else (),
+                        aliases=aliases,
                         scroll=refresh_targets,
                         discovered=discovered,
                     )

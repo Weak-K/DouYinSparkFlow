@@ -233,6 +233,33 @@ class AccountService:
         self.session.flush()
         return written
 
+    def identity_aliases(self, account_id: str, sec_uid: str) -> tuple[str, ...]:
+        """按 sec_uid 取该账号历史上抓到过的身份别名（备注 / 昵称 / 抖音号 / 短号）。
+
+        这条路径**不依赖页面**：`/aweme/v1/web/im/user/info` 只会为「已经出现在
+        会话列表里的会话」返回数据，而目标一旦不在列表里就永远抓不到它的别名 ——
+        可恰恰只有这类目标才需要靠别名去搜索。所以选人前先从库里取一份兜底，
+        让「绑了 sec_uid 就能抗改名」真正成立。
+        """
+
+        if not sec_uid:
+            return ()
+        row = self.session.get(DouyinContactIdentity, (account_id, sec_uid))
+        if row is None:
+            return ()
+        return tuple(
+            dict.fromkeys(
+                value
+                for value in (
+                    row.remark_name,
+                    row.nickname,
+                    row.unique_id,
+                    row.short_id,
+                )
+                if value
+            )
+        )
+
     def decrypt_for_worker(self, account_id: str) -> bytearray:
         account = self.session.get(DouyinAccount, account_id)
         if account is None:

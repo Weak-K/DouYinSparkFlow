@@ -64,6 +64,7 @@ class _RecordingExecutor:
         self.payload_reference = None
         self.target_sec_uid = None
         self.refresh_targets = None
+        self.target_aliases = ()
         self._discovered_names = tuple(discovered_names)
         self._discovered_identities = tuple(discovered_identities)
 
@@ -75,11 +76,13 @@ class _RecordingExecutor:
         credential_version=1,
         target_sec_uid=None,
         refresh_targets=False,
+        target_aliases=(),
     ):
         self.credential_version = credential_version
         self.payload_reference = cookie_payload
         self.target_sec_uid = target_sec_uid
         self.refresh_targets = refresh_targets
+        self.target_aliases = tuple(target_aliases)
         return ExecutionResult(
             True,
             ExecutionStage.COMPLETE,
@@ -427,6 +430,75 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, executor.credential_version)
             self.assertEqual("stable-user-id", executor.target_sec_uid)
             self.assertEqual(0, len(payload))
+
+    async def test_worker_passes_stored_identity_aliases_to_the_executor(self):
+        """页面抓不到别名时（目标不在会话列表里），必须用库里存的历史身份兜底。"""
+
+        now = datetime(2026, 9, 24, 1, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "cookie.key").write_bytes(b"w" * 32)
+            (data_dir / "session.key").write_bytes(b"s" * 32)
+            settings = Settings(
+                data_dir=data_dir,
+                database_url=f"sqlite:///{data_dir / 'worker.db'}",
+                cookie_key_file=data_dir / "cookie.key",
+                session_key_file=data_dir / "session.key",
+            )
+            engine = create_engine(settings.database_url)
+            create_schema(engine)
+            with Session(engine) as session:
+                user = User(username="alias-owner", password_hash="hash")
+                session.add(user)
+                session.flush()
+                account = DouyinAccount(
+                    owner_user_id=user.id,
+                    display_name="alias-account",
+                    encrypted_cookies=b"x",
+                    cookie_nonce=b"n",
+                )
+                session.add(account)
+                session.flush()
+                session.add(
+                    DouyinContactIdentity(
+                        account_id=account.id,
+                        sec_uid="stable-user-id",
+                        nickname="旧昵称",
+                        unique_id="wxid123",
+                        remark_name="备注",
+                    )
+                )
+                task = SparkTask(
+                    owner_user_id=user.id,
+                    douyin_account_id=account.id,
+                    target_name="好友",
+                    send_time="09:00",
+                    message_template="今日火花",
+                    enabled=True,
+                    next_run_at=now,
+                )
+                session.add(task)
+                session.flush()
+                session.add(
+                    SparkTaskTargetIdentity(task_id=task.id, sec_uid="stable-user-id")
+                )
+                session.commit()
+
+            executor = _RecordingExecutor()
+            try:
+                with patch.object(
+                    AccountService,
+                    "decrypt_for_worker",
+                    lambda *_args: bytearray(b"x"),
+                ):
+                    await Worker(
+                        settings, engine, executor=executor, started_at=now
+                    ).run_once(now)
+            finally:
+                engine.dispose()
+
+            # 顺序 = 备注 → 昵称 → 抖音号 → 短号；空值被过滤掉
+            self.assertEqual(("备注", "旧昵称", "wxid123"), executor.target_aliases)
 
     async def test_browser_execution_does_not_hold_sqlite_write_lock(self):
         now = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)
