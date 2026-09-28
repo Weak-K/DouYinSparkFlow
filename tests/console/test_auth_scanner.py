@@ -294,6 +294,35 @@ class _ContextRequest:
         return _ContextResponse(self.authenticated)
 
 
+class _IdentityResponse:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+class _IdentityRequest:
+    """按调用顺序吐出预设响应体，模拟 context.request.get。"""
+
+    def __init__(self, bodies):
+        self.bodies = list(bodies)
+        self.urls = []
+
+    async def get(self, url, **_kwargs):
+        self.urls.append(url)
+        body = self.bodies.pop(0) if self.bodies else {}
+        return _IdentityResponse(body)
+
+
+def _identity_context(bodies):
+    """构造只满足 _account_identity 需要的最小 context（仅需 .request.get）。"""
+
+    context = type("_IdentityContext", (), {})()
+    context.request = _IdentityRequest(bodies)
+    return context
+
+
 class _Keyboard:
     def __init__(self):
         self.values = []
@@ -485,6 +514,47 @@ class DouyinQrScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(("wzlovegsy", "gsy"), result.conversation_names)
         self.assertTrue(context.closed)
         self.assertTrue(browser.closed)
+
+    async def test_account_identity_reads_user_from_response_top_level(self):
+        """线上实测（2026-09-28）：creator 接口把 user 放在**响应顶层**。
+
+        早先实现只读 body["data"]["user"]，于是成功响应被当成没取到，
+        昵称一路回退成「抖音账号」。这里锁定顶层取值这一行为。
+        """
+
+        context = _identity_context(
+            [
+                {
+                    "status_code": 0,
+                    "user": {"nickname": "真实昵称", "unique_id": "abc12345678"},
+                }
+            ]
+        )
+
+        identity = await DouyinQrScanner._account_identity(context)
+
+        self.assertEqual(("真实昵称", "abc12345678"), identity)
+
+    async def test_account_identity_skips_blocked_response_then_uses_data_user(self):
+        """www 的 profile/self 会回 status_msg=blocked、user=null，必须继续往下试。"""
+
+        context = _identity_context(
+            [
+                {"status_code": 0, "status_msg": "blocked", "user": None},
+                {"data": {"user": {"nickname": "备用昵称", "unique_id": "xyz7890"}}},
+            ]
+        )
+
+        identity = await DouyinQrScanner._account_identity(context)
+
+        self.assertEqual(("备用昵称", "xyz7890"), identity)
+
+    async def test_account_identity_returns_none_when_no_user_object(self):
+        context = _identity_context([{"status_code": 8, "status_msg": "用户未登录"}])
+
+        identity = await DouyinQrScanner._account_identity(context)
+
+        self.assertEqual((None, None), identity)
 
     async def test_cloud_browser_stream_types_claimed_verification_code(self):
         scanner, _browser, context = self._scanner(mode="timeout")

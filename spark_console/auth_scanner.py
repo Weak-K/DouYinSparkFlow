@@ -19,9 +19,13 @@ from core.web_chat import (
 
 CHAT_LOGIN_URL = "https://www.douyin.com/chat"
 ACCOUNT_INFO_URL = "https://www.douyin.com/passport/account/info/v2/?aid=6383"
-# 本仓库新增：真正带「主页昵称 / 抖音号」的两个接口（用已知真值实测命中）：
-#   aweme/v1/web/user/profile/self/  → data.user.nickname / data.user.unique_id
-#   creator.../api/media/user/info/  → data.user.nickname / data.user.unique_id
+# 本仓库新增：真正带「主页昵称 / 抖音号」的两个接口。
+# 2026-09-28 线上实测（用有效账号的 storage_state 直连）：
+#   creator.../api/media/user/info/  → status_code=0，**user 在响应顶层**，nickname/unique_id 齐全
+#   aweme/v1/web/user/profile/self/  → status_code=0 但 status_msg="blocked"、user=null
+#     （该接口对无 a_bogus 签名的请求一律拦截，所以 creator 侧才是主路径，它只作兜底）
+# 两者都把 user 放在**顶层** `body["user"]`；早期实现只读 `body["data"]["user"]`，
+# 于是 creator 明明成功也被丢弃 → 一路回退成「抖音账号」。层级现已兼容两种。
 # 注意 passport/account/info/v2 只返回通行证账号的系统默认名（如「用户8554931251671」），
 # 不是主页昵称，别用它取名字。
 SELF_PROFILE_URL = (
@@ -62,6 +66,26 @@ CONFIRMING_TEXT = ("扫码成功", "请在手机上确认", "已扫码")
 VERIFICATION_TEXT = ("安全验证", "请完成验证")
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_user_object(body) -> dict | None:
+    """从身份接口响应里取出 user 对象，兼容两种层级。
+
+    线上实测（2026-09-28）：creator 的 media/user/info 与 www 的 profile/self
+    都是把 user 放在**顶层** ``body["user"]``；早先只认 ``body["data"]["user"]``，
+    结果成功响应被当成没取到。顶层优先，data.user 作兼容。
+    """
+
+    if not isinstance(body, dict):
+        return None
+    data = body.get("data")
+    for candidate in (
+        body.get("user"),
+        data.get("user") if isinstance(data, dict) else None,
+    ):
+        if isinstance(candidate, dict):
+            return candidate
+    return None
 
 
 class QrLoadFailed(Exception):
@@ -540,23 +564,28 @@ class DouyinQrScanner:
         """本仓库新增：取当前登录账号的（主页昵称, 抖音号）。
 
         依次尝试：
-          1. www.douyin.com/aweme/v1/web/user/profile/self/  → data.user.nickname / unique_id
-          2. creator.douyin.com/web/api/media/user/info/     → data.user.nickname / unique_id
+          1. creator.douyin.com/web/api/media/user/info/     → user.nickname / unique_id
+          2. www.douyin.com/aweme/v1/web/user/profile/self/  → user.nickname / unique_id
         任一成功即返回；都取不到返回 (None, None)。
+
+        creator 侧优先：2026-09-28 线上实测它稳定返回 status_code=0 且昵称、抖音号齐全，
+        而 www 的 profile/self 对无签名请求固定回 status_msg="blocked"、user=null。
+        两侧的 user 都在响应**顶层**，用 _extract_user_object 统一取（见该函数注释）。
+
         用途：扫码登录后让「账号备注」自动填成真实昵称，不再依赖易失配的页面 XPath
-        （上游原 XPath 指向创作者中心深层 div，页面一改版就命中不了）。
+        （上游原 XPath 指向创作者中心 garfish 深层 div，而扫码登录停在
+        www.douyin.com/chat，那个 DOM 根本不存在，必然失配）。
         这里**只读**昵称与抖音号，不碰手机号等字段，也不打印响应内容。
         """
 
-        for url in (SELF_PROFILE_URL, CREATOR_USER_INFO_URL):
+        for url in (CREATOR_USER_INFO_URL, SELF_PROFILE_URL):
             try:
                 response = await context.request.get(url, timeout=10_000)
                 body = await response.json()
             except Exception:
                 continue
-            data = body.get("data") if isinstance(body, dict) else None
-            user = data.get("user") if isinstance(data, dict) else None
-            if not isinstance(user, dict):
+            user = _extract_user_object(body)
+            if user is None:
                 continue
             nickname = user.get("nickname") or user.get("other_nickname")
             unique_id = user.get("unique_id")
