@@ -97,6 +97,46 @@ class TaskService:
         self.audit.write(owner_id, "task.created", "spark_task", task.id)
         return task
 
+    def create_many(
+        self,
+        owner_id: str,
+        account_id: str,
+        targets: list[tuple[str, str]],
+        send_time: str,
+        message_template: str,
+    ) -> tuple[list[SparkTask], list[tuple[str, str]]]:
+        """一次给多位好友建任务（同一个账号、时间、内容）。
+
+        返回 ``(已创建的任务, [(好友名, 跳过原因), ...])``。
+
+        每条**成功即 commit、失败即 rollback**，所以单个好友出错（该时间已有任务、
+        昵称不合法、不属于该账号等）只丢掉它自己，不会连累同批已建好的任务
+        —— 否则 create() 里那次整事务 rollback 会把前面的成果一起清空。
+        """
+
+        created: list[SparkTask] = []
+        skipped: list[tuple[str, str]] = []
+        for name, sec_uid in targets:
+            try:
+                task = self.create(
+                    owner_id,
+                    account_id,
+                    name,
+                    send_time,
+                    message_template,
+                    target_sec_uid=sec_uid,
+                )
+            except Conflict:
+                self.session.rollback()
+                skipped.append((name, "该时间已有发往此好友的启用任务"))
+            except ValidationError as error:
+                self.session.rollback()
+                skipped.append((name, str(error)))
+            else:
+                self.session.commit()
+                created.append(task)
+        return created, skipped
+
     def set_enabled_owned(self, owner_id: str, task_id: str, enabled: bool) -> SparkTask:
         task = self.get_owned(owner_id, task_id)
         if enabled and task.douyin_account_id is None:

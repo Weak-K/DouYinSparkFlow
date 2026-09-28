@@ -1,8 +1,10 @@
+import json
 import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -362,8 +364,9 @@ class UserWebTests(unittest.TestCase):
         )
         # 好友名单来自快照，前端要能显示它是何时更新的。
         self.assertTrue(body["scanned_at"])
-        self.assertIn('list="task-target-options"', tasks_page.text)
-        self.assertIn('name="target_sec_uid"', tasks_page.text)
+        self.assertIn('id="task-target-list"', tasks_page.text)
+        self.assertIn('name="targets"', tasks_page.text)
+        self.assertIn("/static/task_targets.js", tasks_page.text)
         self.assertIn("重读已保存名单", tasks_page.text)
         self.assertNotIn("secret-marker", response.text)
 
@@ -410,6 +413,88 @@ class UserWebTests(unittest.TestCase):
             task = session.scalar(select(SparkTask).where(SparkTask.owner_user_id == user.id))
             binding = session.get(SparkTaskTargetIdentity, task.id)
             self.assertEqual("stable-user-id", binding.sec_uid)
+
+    def test_new_task_creates_one_task_per_selected_target(self):
+        """一次勾选多位好友：每位好友各建一条任务，并各自绑定 sec_uid。"""
+
+        self.login()
+        with session_scope(self.engine) as session:
+            user = session.scalar(select(User).where(User.username == "friend"))
+            user.must_change_password = False
+            account = AccountService(
+                session,
+                CookieCipher(self.settings.cookie_key_file.read_bytes()),
+                AuditService(session),
+            ).create(
+                user.id,
+                "批量抖音",
+                b'[{"name":"sessionid","value":"secret","url":"https://www.douyin.com"}]',
+            )
+            session.add_all(
+                [
+                    DouyinContactIdentity(
+                        account_id=account.id, sec_uid="batch-uid-a", nickname="好友甲"
+                    ),
+                    DouyinContactIdentity(
+                        account_id=account.id, sec_uid="batch-uid-b", nickname="好友乙"
+                    ),
+                ]
+            )
+            account_id = account.id
+        page = self.client.get("/tasks")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+        response = self.client.post(
+            "/tasks",
+            data={
+                "csrf_token": csrf,
+                "account_id": account_id,
+                "targets": json.dumps(
+                    [
+                        {"name": "好友甲", "sec_uid": "batch-uid-a"},
+                        {"name": "好友乙", "sec_uid": "batch-uid-b"},
+                    ]
+                ),
+                "send_time": "09:00",
+                "message_template": "今日火花",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertIn("created=2", response.headers["location"])
+        with session_scope(self.engine) as session:
+            tasks = session.scalars(
+                select(SparkTask).where(SparkTask.owner_user_id == user.id)
+            ).all()
+            self.assertEqual({"好友甲", "好友乙"}, {task.target_name for task in tasks})
+            bindings = {
+                session.get(SparkTaskTargetIdentity, task.id).sec_uid for task in tasks
+            }
+            self.assertEqual({"batch-uid-a", "batch-uid-b"}, bindings)
+
+    def test_new_task_reports_error_when_nothing_selected(self):
+        self.login()
+        with session_scope(self.engine) as session:
+            user = session.scalar(select(User).where(User.username == "friend"))
+            user.must_change_password = False
+        page = self.client.get("/tasks")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+        response = self.client.post(
+            "/tasks",
+            data={
+                "csrf_token": csrf,
+                "account_id": "whatever",
+                "targets": "[]",
+                "send_time": "09:00",
+                "message_template": "今日火花",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertIn("请至少选择一位好友", unquote(response.headers["location"]))
 
     def test_user_can_open_and_submit_task_editor(self):
         self.login()

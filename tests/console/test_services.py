@@ -203,6 +203,58 @@ class ServiceTests(unittest.TestCase):
                 target_sec_uid="other-account-contact",
             )
 
+    def test_create_many_keeps_earlier_tasks_when_one_duplicates(self):
+        """批量建任务时，某位好友撞唯一约束不能让同批已建好的任务一起被回滚。"""
+
+        self.tasks.create(
+            self.owner.id, self.account.id, "已存在的好友", "09:00", "今日火花"
+        )
+        self.session.flush()
+
+        created, skipped = self.tasks.create_many(
+            self.owner.id,
+            self.account.id,
+            [("甲", ""), ("已存在的好友", ""), ("乙", "")],
+            "09:00",
+            "今日火花",
+        )
+        self.session.flush()
+
+        self.assertEqual(["甲", "乙"], [task.target_name for task in created])
+        self.assertEqual(["已存在的好友"], [name for name, _reason in skipped])
+        persisted = self.session.scalars(
+            select(SparkTask).where(SparkTask.owner_user_id == self.owner.id)
+        ).all()
+        self.assertEqual(
+            {"已存在的好友", "甲", "乙"}, {task.target_name for task in persisted}
+        )
+
+    def test_create_many_skips_contact_belonging_to_another_account(self):
+        other_account = self.accounts.create(
+            self.owner.id, "别的账号", b'[{"name":"sid","value":"other2"}]'
+        )
+        self.session.add(
+            DouyinContactIdentity(
+                account_id=other_account.id,
+                sec_uid="foreign-contact",
+                nickname="别家的好友",
+            )
+        )
+        self.session.flush()
+
+        created, skipped = self.tasks.create_many(
+            self.owner.id,
+            self.account.id,
+            [("自家好友", ""), ("别家的好友", "foreign-contact")],
+            "09:00",
+            "今日火花",
+        )
+        self.session.flush()
+
+        self.assertEqual(["自家好友"], [task.target_name for task in created])
+        self.assertEqual(1, len(skipped))
+        self.assertEqual("别家的好友", skipped[0][0])
+
     def test_owner_can_update_task_schedule_message_and_stable_target(self):
         self.session.add(
             DouyinContactIdentity(

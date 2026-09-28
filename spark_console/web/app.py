@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from math import ceil
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 import uvicorn
@@ -110,6 +111,54 @@ def _positive_page(value: str | None) -> int:
         return max(1, int(value or "1"))
     except ValueError:
         return 1
+
+
+def _positive_int(value) -> int:
+    try:
+        number = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _parse_targets(
+    raw: str, fallback_name: str = "", fallback_sec_uid: str = ""
+) -> list[tuple[str, str]]:
+    """把「新建任务」表单的目标好友解析成 ``[(昵称, sec_uid), ...]``。
+
+    新表单提交 ``targets``（JSON 数组，元素形如 ``{"name": ..., "sec_uid": ...}``），
+    支持一次勾选多位好友；老表单/编辑页只提交单个 ``target_name`` + ``target_sec_uid``，
+    这里一并兼容。同名或同一 sec_uid 只保留一次，顺序保持用户勾选顺序。
+    """
+
+    picked: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def push(name, sec_uid) -> None:
+        clean_name = str(name or "").strip()
+        if not clean_name or len(clean_name) > 64:
+            return
+        clean_uid = str(sec_uid or "").strip()
+        key = clean_uid or clean_name
+        if key in seen:
+            return
+        seen.add(key)
+        picked.append((clean_name, clean_uid))
+
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    push(item.get("name"), item.get("sec_uid"))
+                elif isinstance(item, str):
+                    push(item, "")
+    if not picked:
+        push(fallback_name, fallback_sec_uid)
+    return picked
 
 
 def _page_info(items, requested: int, per_page: int):
@@ -554,29 +603,56 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
             user, _record, context = auth.user_context(request, db)
             task_service = TaskService(db, AccountService(db, cipher, AuditService(db)), AuditService(db))
             accounts = AccountService(db, cipher, AuditService(db)).list_owned(user.id)
-            return page(request, "tasks.html", title="续火任务", tasks=task_service.list_owned(user.id), accounts=accounts, **context)
+            created = _positive_int(request.query_params.get("created"))
+            skipped = _positive_int(request.query_params.get("skipped"))
+            error = (request.query_params.get("error") or "").strip()[:200]
+            notice = None
+            if created:
+                notice = f"已创建 {created} 条续火任务"
+                if skipped:
+                    notice += f"，另有 {skipped} 位好友被跳过（该时间已有任务）"
+            return page(request, "tasks.html", title="续火任务", tasks=task_service.list_owned(user.id), accounts=accounts, notice=notice, error=error or None, **context)
 
     @app.post("/tasks")
     def add_task(
         request: Request,
         csrf_token: str = Form(default=""),
-        account_id: str = Form(), target_name: str = Form(),
+        account_id: str = Form(),
+        targets: str = Form(default=""),
+        target_name: str = Form(default=""),
         target_sec_uid: str = Form(default=""),
         send_time: str = Form(), message_template: str = Form(),
     ):
+        error = ""
+        created = 0
+        skipped = 0
         with session_scope(engine) as db:
             user, record = auth.current(request, db)
             auth.csrf(record, csrf_token)
             service = TaskService(db, AccountService(db, cipher, AuditService(db)), AuditService(db))
-            service.create(
-                user.id,
-                account_id,
-                target_name,
-                send_time,
-                message_template,
-                target_sec_uid=target_sec_uid,
-            )
-        return RedirectResponse("/tasks", status_code=303)
+            picked = _parse_targets(targets, target_name, target_sec_uid)
+            if not picked:
+                error = "请至少选择一位好友"
+            else:
+                created_tasks, skipped_items = service.create_many(
+                    user.id,
+                    account_id,
+                    picked,
+                    send_time,
+                    message_template,
+                )
+                created = len(created_tasks)
+                skipped = len(skipped_items)
+                if not created:
+                    detail = "；".join(
+                        f"{name}：{reason}" for name, reason in skipped_items
+                    ) or "未知原因"
+                    error = f"所选好友都没能创建（{detail}）"
+        if error:
+            return RedirectResponse(f"/tasks?error={quote(error)}", status_code=303)
+        return RedirectResponse(
+            f"/tasks?created={created}&skipped={skipped}", status_code=303
+        )
 
     @app.get("/tasks/{task_id}/edit")
     def edit_task_page(request: Request, task_id: str):
