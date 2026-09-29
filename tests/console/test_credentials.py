@@ -594,6 +594,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, len(browser.context_options))
         self.assertEqual(1, len(browser.context.cookies_added))
         self.assertEqual("target_not_found", result.error_code)
+        self.assertTrue(result.retryable)
 
     async def test_executor_creates_version_two_context_without_adding_cookies(self):
         raw = b'{"version":2,"storage_state":{"cookies":[{"name":"sid","value":"storage-executor-marker","domain":".douyin.com","path":"/","expires":-1,"httpOnly":true,"secure":true,"sameSite":"Lax"}],"origins":[]}}'

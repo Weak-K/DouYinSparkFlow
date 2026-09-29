@@ -43,6 +43,20 @@ class FakeConversationList:
     async def all(self):
         return self.items
 
+    async def count(self):
+        return len(self.items)
+
+    async def click(self):
+        assert len(self.items) == 1
+        await self.items[0].click()
+
+    def filter(self, *, has=None, has_text=None):
+        if has_text is not None:
+            return has_text
+        return FakeConversationList([
+            item for item in self.items if item.visible and has.fullmatch(item.title)
+        ])
+
 
 class FakeWebChatPage:
     def __init__(self, titles, visible=None):
@@ -362,7 +376,7 @@ class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
                 self.search_requested = False
 
             def locator(self, selector):
-                if selector == ".conversationConversationItemwrapper":
+                if selector.startswith(".conversationConversationItem"):
                     return FakeConversationList([self.item])
                 self.search_requested = True
                 raise AssertionError("search should not open when the target is already visible")
@@ -426,7 +440,7 @@ class FakeScrollContainer:
         self.conversation_list.reveal_next_batch()
 
 
-class FakeLazyConversationList:
+class FakeLazyConversationList(FakeConversationList):
     """模拟抖音左栏：滚到底才渲染下一屏。"""
 
     def __init__(self, batches):
@@ -438,6 +452,10 @@ class FakeLazyConversationList:
             self.revealed += 1
 
     async def all(self):
+        return self.items
+
+    @property
+    def items(self):
         return [
             FakeConversation(title)
             for batch in self.batches[: self.revealed]

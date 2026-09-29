@@ -34,6 +34,8 @@ logger = logging.getLogger("spark.worker")
 
 class Worker:
     STARTUP_GRACE = timedelta(minutes=5)
+    ADMISSION_GRACE = timedelta(minutes=10)
+    MAX_QUEUE_AGE = timedelta(hours=1)
     RETRY_DELAYS = (timedelta(minutes=1), timedelta(minutes=5))
     EXECUTION_TIMEOUT_SECONDS = 180
     # 好友快照超过这个时长就借下一次执行顺手刷新一次（每个账号每天最多一次）。
@@ -69,7 +71,27 @@ class Worker:
             )
         )
         self.cipher = CookieCipher(settings.cookie_key_file.read_bytes())
+        self._admitted_runs: set[tuple[str, datetime]] = set()
         self._recover_interrupted_runs()
+
+    def _admit_due_tasks(self, db, now: datetime) -> None:
+        due = db.execute(
+            select(SparkTask.id, SparkTask.next_run_at).where(
+                SparkTask.enabled.is_(True),
+                SparkTask.douyin_account_id.is_not(None),
+                SparkTask.next_run_at <= now,
+            )
+        ).all()
+        admitted = set()
+        for task_id, scheduled in due:
+            scheduled = scheduled if scheduled.tzinfo else scheduled.replace(tzinfo=timezone.utc)
+            key = (task_id, scheduled)
+            age = now - scheduled
+            grace = self.STARTUP_GRACE if scheduled < self.started_at else self.ADMISSION_GRACE
+            # 按时被在线 Worker 看见的任务允许排队；进程重启不会继承旧队列。
+            if age <= grace or (key in self._admitted_runs and age <= self.MAX_QUEUE_AGE):
+                admitted.add(key)
+        self._admitted_runs = admitted
 
     def _recover_interrupted_runs(self) -> None:
         retry_at = self.started_at + self.RETRY_DELAYS[0]
@@ -104,6 +126,7 @@ class Worker:
             lock.lease_until = current_time + timedelta(
                 seconds=max(30, self.settings.worker_poll_seconds * 3)
             )
+            self._admit_due_tasks(db, current_time)
             run = claim_next_due_task(db, current_time, self.worker_id)
             if run is None:
                 return None
@@ -118,7 +141,9 @@ class Worker:
             if abs(self.clock_offset_seconds) > self.settings.clock_offset_limit_seconds:
                 return finish_run(run, "failed", "clock_check", current_time, "system_time_unhealthy", "服务器时间未同步")
             scheduled = run.scheduled_for if run.scheduled_for.tzinfo else run.scheduled_for.replace(tzinfo=timezone.utc)
-            if scheduled < self.started_at and current_time - scheduled > self.STARTUP_GRACE:
+            admitted = (run.task_id, scheduled) in self._admitted_runs
+            self._admitted_runs.discard((run.task_id, scheduled))
+            if not admitted and scheduled < self.started_at and current_time - scheduled > self.STARTUP_GRACE:
                 return finish_run(
                     run,
                     "skipped",
@@ -127,8 +152,8 @@ class Worker:
                     "worker_was_offline",
                     "执行器离线期间任务已错过，未补发",
                 )
-            if current_time - scheduled > timedelta(minutes=10):
-                return finish_run(run, "skipped", "late", current_time, "missed_window", "任务已超过 10 分钟发送窗口")
+            if not admitted and current_time - scheduled > self.ADMISSION_GRACE:
+                return finish_run(run, "skipped", "late", current_time, "missed_window", "任务未及时进入队列，或排队已超过 1 小时")
             account_service = AccountService(db, self.cipher, AuditService(db))
             account = db.get(DouyinAccount, task.douyin_account_id)
             credential_version = account.cookie_version
@@ -313,15 +338,20 @@ class Worker:
             f"retry_scheduled_{int(delay.total_seconds() // 60)}m"
             for delay in self.RETRY_DELAYS
         )
-        used_codes = set(
-            db.scalars(
-                select(TaskRun.error_code).where(
-                    TaskRun.task_id == task.id,
-                    TaskRun.started_at >= now - timedelta(minutes=15),
-                    TaskRun.error_code.in_(retry_codes),
-                )
-            ).all()
-        )
+        previous_codes = db.scalars(
+            select(TaskRun.error_code).where(
+                TaskRun.task_id == task.id,
+                TaskRun.id != run.id,
+            )
+            .order_by(TaskRun.started_at.desc(), TaskRun.id.desc())
+            .limit(len(retry_codes))
+        ).all()
+        # 按连续重试链计数，排队超过 15 分钟也不能重新获得一轮重试额度。
+        used_codes = set()
+        for code in previous_codes:
+            if code not in retry_codes:
+                break
+            used_codes.add(code)
         for delay, code in zip(self.RETRY_DELAYS, retry_codes):
             if code in used_codes:
                 continue
@@ -352,10 +382,17 @@ async def run_loop() -> None:
             loop.add_signal_handler(signum, stopping.set)
         except NotImplementedError:
             pass
+    await _poll_tasks(worker, stopping)
+
+
+async def _poll_tasks(worker, stopping):
     while not stopping.is_set():
-        await worker.run_once()
+        result = await worker.run_once()
+        if result is not None:
+            # 有积压时立即领取下一条，只有空队列才等待轮询间隔。
+            continue
         try:
-            await asyncio.wait_for(stopping.wait(), timeout=settings.worker_poll_seconds)
+            await asyncio.wait_for(stopping.wait(), timeout=worker.settings.worker_poll_seconds)
         except TimeoutError:
             continue
 

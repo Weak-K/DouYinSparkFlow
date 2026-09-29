@@ -155,6 +155,7 @@ class DouyinExecutor:
                 ExecutionStage.SELECTING_TARGET,
                 "target_not_found",
                 "未找到完全匹配的目标好友",
+                retryable=True,
                 discovered_names=tuple(discovered),
             )
         except CredentialError:

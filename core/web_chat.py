@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -264,7 +265,7 @@ async def _click_search_result(result) -> None:
 
 async def _wait_for_visible_search_results(page, candidate, timeout_ms):
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + min(3.0, max(0.2, timeout_ms / 1000))
+    deadline = loop.time() + max(0, timeout_ms / 1000)
     while True:
         exact = page.get_by_text(candidate, exact=True)
         if await exact.count() > 0:
@@ -299,9 +300,11 @@ async def _search_in_panel(page, field, candidate, timeout_ms):
                 await field.fill("")
             except (AttributeError, TypeError):
                 pass
-            await asyncio.sleep(SEARCH_COLD_START_SETTLE_SECONDS)
+            await asyncio.sleep(min(SEARCH_COLD_START_SETTLE_SECONDS, timeout_ms / 10000))
         await field.fill(candidate)
-        results = await _wait_for_visible_search_results(page, candidate, timeout_ms)
+        # 冷启动先短等一次，重搜后给慢响应更多时间；外层限制整个选人预算。
+        wait_ms = min(timeout_ms / (SEARCH_COLD_START_RETRIES + 1), 3000 if attempt == 0 else 8000)
+        results = await _wait_for_visible_search_results(page, candidate, wait_ms)
         if results:
             return results
     return []
@@ -338,11 +341,28 @@ def matches_opened_conversation(opened_title: str, candidates) -> bool:
 async def select_web_chat_target(
     page, target, timeout=30000, aliases=(), scroll=False, discovered=None
 ):
+    async with asyncio.timeout(timeout / 1000):
+        return await _select_web_chat_target(
+            page, target, timeout, aliases, scroll, discovered
+        )
+
+
+async def _click_conversation_row(page, row):
+    # all() 返回的是按位置重查的 locator。点击时按标题重新定位，防止列表重排后换人。
+    title = page.locator(CONVERSATION_TITLE_SELECTOR).filter(
+        has_text=re.compile(r"^\s*" + re.escape(row.title) + r"\s*$")
+    )
+    current = page.locator(CONVERSATION_ITEM_SELECTOR + ":visible").filter(has=title)
+    if await current.count() != 1:
+        return False
+    await current.click()
+    return True
+
+
+async def _select_web_chat_target(page, target, timeout, aliases, scroll, discovered):
     """Select one exact target, preferring real conversation rows over page text.
 
-    `scroll=True` 时先把左侧会话列表滚动加载完整再匹配（首屏只有十来条，
-    更靠下的好友根本扫不到）。`discovered` 是可选的列表出参：把本次真正看到的
-    会话显示名写回去，调用方据此刷新好友快照。
+    滚动快照只用于记录名字，点击必须重新读取当前列表，不能重用滚动前的行位置。
     """
 
     normalized_target = target.strip()
@@ -362,11 +382,17 @@ async def select_web_chat_target(
             if row.title and row.title not in discovered:
                 discovered.append(row.title)
 
-    rows = await _conversation_rows(page, scroll=scroll)
+    if scroll:
+        remember(await _conversation_rows(page, scroll=True))
+        container = page.locator(CONVERSATION_LIST_SELECTOR)
+        if await container.count() > 0:
+            await container.first.evaluate("element => { element.scrollTop = 0; }")
+            await page.wait_for_timeout(150)
+
+    rows = await _conversation_rows(page, scroll=False)
     remember(rows)
     for row in rows:
-        if row.title in raw_candidates:
-            await row.locator.click()
+        if row.title in raw_candidates and await _click_conversation_row(page, row):
             return row.title
 
     for selector in SEARCH_INPUT_SELECTORS:
@@ -380,30 +406,29 @@ async def select_web_chat_target(
                 for result in results:
                     await _click_search_result(result)
                     return candidate
+            # 搜索结果会覆盖左栏，必须退出搜索再检查会话，不能在搜索态白等列表。
+            await field.fill("")
+            break
         except (AttributeError, TypeError):
             # Older page doubles and older layouts have no global search surface.
             break
 
     await page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=timeout)
 
-    known = {row.title for row in rows}
-    retry_rows = await _conversation_rows(page, scroll=False)
-    remember(retry_rows)
-    for row in retry_rows:
-        if row.title not in known:
-            known.add(row.title)
-            rows.append(row)
+    rows = await _conversation_rows(page, scroll=False)
+    remember(rows)
 
     for row in rows:
-        if row.title in raw_candidates:
-            await row.locator.click()
+        if row.title in raw_candidates and await _click_conversation_row(page, row):
             return row.title
 
     # 精确名全没命中时，只放宽「零宽字符/空白差异」，绝不放宽大小写，
     # 免得把消息发给另一个同名不同大小写的人。
     for row in rows:
-        if normalize_target_name(row.title) in folded_candidates:
-            await row.locator.click()
+        if (
+            normalize_target_name(row.title) in folded_candidates
+            and await _click_conversation_row(page, row)
+        ):
             return row.title
 
     raise TargetNotFoundError(f"未在抖音聊天列表中找到好友 {normalized_target}")
