@@ -741,8 +741,8 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual("selecting_target", result.stage)
         self.assertEqual("wrong_conversation_opened", result.error_code)
-        # 不重试：重试只会再发错一次
-        self.assertFalse(result.retryable)
+        # 不会发送到错误会话；刷新浏览器后允许重新选人重试。
+        self.assertTrue(result.retryable)
 
     async def test_executor_resolves_current_alias_from_stable_identity(self):
         page = _FakeIdentityPage()

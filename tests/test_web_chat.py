@@ -9,6 +9,7 @@ from core.web_chat import (
     matches_opened_conversation,
     normalize_target_name,
     select_web_chat_target,
+    wait_for_opened_conversation,
 )
 
 
@@ -480,6 +481,28 @@ class FakeScrollingPage:
 
 
 class WebChatNameNormalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waits_for_the_opened_title_to_switch(self):
+        class Header:
+            def __init__(self):
+                self.reads = 0
+                self.first = self
+
+            async def count(self):
+                return 1
+
+            async def inner_text(self):
+                self.reads += 1
+                return "旧会话" if self.reads < 2 else "目标"
+
+        class Page:
+            def locator(self, _selector):
+                return HeaderLocator
+
+        HeaderLocator = Header()
+        opened = await wait_for_opened_conversation(Page(), ("目标",), timeout_ms=500)
+
+        self.assertEqual("目标", opened)
+
     async def test_only_sends_when_the_opened_conversation_is_the_target(self):
         """发送前的标题校验：打开的必须是目标本人或它的别名，否则一律拒绝。"""
 

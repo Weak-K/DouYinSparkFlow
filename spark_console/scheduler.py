@@ -65,6 +65,7 @@ def finish_run(
     now: datetime,
     error_code: str | None = None,
     error_summary: str | None = None,
+    notification=None,
 ) -> TaskRun:
     run.status = status
     run.stage = stage
@@ -72,16 +73,17 @@ def finish_run(
     run.error_code = error_code
     run.error_summary = error_summary[:240] if error_summary else None
     if status == "failed":
-        # 本仓库新增：失败（含 Cookie 失效）时发告警邮件。
+        # 失败通知必须带任务所属用户，避免把一个账号的失败发给另一个账号。
         # 放在这里是因为 finish_run 是所有失败路径的唯一收尾点；notify 内部
-        # 异步发送且有冷却窗口，不会阻塞当前事务，并会自行跳过 cookie_invalid
-        # 与「已安排重试」的中间态。详见 spark_console/notify.py。
+        # 异步发送且有冷却窗口，不会阻塞当前事务。详见 spark_console/notify.py。
         from spark_console import notify
 
-        notify.alert_task_failure(
-            stage=stage,
-            error_code=error_code or "",
-            error_summary=run.error_summary or "",
-            task_id=run.task_id or "",
-        )
+        if notification is not None:
+            notify.alert_task_failure(
+                stage=stage,
+                error_code=error_code or "",
+                error_summary=run.error_summary or "",
+                task_id=run.task_id or "",
+                context=notification,
+            )
     return run

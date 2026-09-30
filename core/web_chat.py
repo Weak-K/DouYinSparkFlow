@@ -338,6 +338,24 @@ def matches_opened_conversation(opened_title: str, candidates) -> bool:
     )
 
 
+async def wait_for_opened_conversation(
+    page, candidates, timeout_ms: int = 2000
+) -> str:
+    """等待聊天区标题切换到本次选中的目标，避免读到上一个会话的旧标题。"""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0, timeout_ms / 1000)
+    opened = ""
+    while True:
+        opened = await opened_conversation_title(page)
+        if matches_opened_conversation(opened, candidates):
+            return opened
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return opened
+        await asyncio.sleep(min(0.1, remaining))
+
+
 async def select_web_chat_target(
     page, target, timeout=30000, aliases=(), scroll=False, discovered=None
 ):

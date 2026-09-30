@@ -7,15 +7,15 @@
 
 - `notify_cookie_expired()`：某个抖音号 Cookie 失效时，**只通知该号所属用户本人**
   （收件人取 `users.email`）。每个控制台账号名下的抖音号不同，所以不做全局群发；
-  该用户尚未填写邮箱时，兜底发给 `SPARK_ALERT_EMAIL_TO`，避免旧账号静默漏提醒。
-- `alert_task_failure()`：其他任务失败时通知运维收件人，带**冷却窗口**（默认 60 分钟）
+  该用户尚未填写邮箱时跳过发送，避免把提醒发给其他账号。
+- `alert_task_failure()`：任务失败时通知任务所属用户本人，带**冷却窗口**（默认 60 分钟）
   且在**守护线程**里发送，不阻塞调用方事务。两类失败不走这条路：`cookie_invalid`
   （已按用户发给本人）和 `retry_scheduled_*`（只是「已安排自动重试」的中间态，不是最终失败）。
 
 环境变量（写在 .env.console）
     SPARK_SMTP_HOST / _PORT / _SECURITY / _USER / _PASSWORD / _FROM
-    SPARK_ALERT_EMAIL_TO          全局兜底收件人，多个用逗号分隔
-    SPARK_ALERT_COOLDOWN_MINUTES  全局告警最小间隔（默认 60）
+    SPARK_ALERT_EMAIL_TO          保留用于兼容配置和独立测试邮件，不作为任务收件人
+    SPARK_ALERT_COOLDOWN_MINUTES  每个用户的告警最小间隔（默认 60）
     SPARK_DATA_DIR                冷却状态文件所在目录（默认 /data）
 """
 
@@ -46,7 +46,7 @@ STATE_FILENAME = "alert-state.json"
 SUPPORTED_SECURITY = {"ssl", "starttls", "plain"}
 CONSOLE_URL = "https://lgnsl.com/spark/"
 
-# 这些错误码通常意味着账号未登录 / Cookie 失效，全局邮件里给出对应提示
+# 这些错误码通常意味着账号未登录 / Cookie 失效，任务主人邮件里给出对应提示
 COOKIE_RELATED_CODES = {"cookie_invalid", "conversation_not_opened", "target_not_found"}
 
 # 已由「按用户」的失效提醒覆盖，全局告警不再重复发
@@ -108,6 +108,15 @@ class MailSettings:
     @property
     def configured(self) -> bool:
         return bool(self.host and self.username and self.password and self.sender)
+
+
+@dataclass(frozen=True)
+class TaskFailureContext:
+    owner_user_id: str
+    recipient: str | None
+    owner_username: str = ""
+    account_name: str = ""
+    target_name: str = ""
 
 
 def _footnote() -> str:
@@ -183,14 +192,13 @@ def notify_cookie_expired(
     occurred_at: str,
     detail: str = "",
 ) -> bool:
-    """某个抖音号 Cookie 失效：通知该号所属用户本人，没填邮箱时兜底给运维收件人。"""
+    """某个抖音号 Cookie 失效：只通知该号所属用户本人。"""
 
-    fallback = not recipient
-    targets: list[str] = list(settings.alert_recipients) if fallback else [recipient]
-    if not targets:
-        logger.warning("该用户未填写通知邮箱且未配置兜底收件人，跳过发送")
+    if not recipient or not recipient.strip():
+        logger.warning("该用户未填写通知邮箱，跳过 Cookie 失效通知")
         return False
 
+    targets = [recipient.strip()]
     subject = f"【火花控制台】抖音号「{account_name}」Cookie 已失效"
     body = (
         f"控制台账号：{owner_username}\n"
@@ -199,8 +207,6 @@ def notify_cookie_expired(
         f"时间：{occurred_at}\n"
         "\n请登录控制台，在「抖音账号」页面重新扫码绑定该号。\n"
     )
-    if fallback:
-        body += "\n（该抖音号所属用户尚未填写通知邮箱，本邮件改发给运维收件人。）\n"
     if detail:
         body += f"\n详情：{detail}\n"
     return send_mail(settings, targets, subject, body)
@@ -229,7 +235,12 @@ def _write_state(settings: MailSettings, state: dict) -> None:
 
 
 def _build_failure_body(
-    stage: str, error_code: str, error_summary: str, suppressed: int, task_id: str = ""
+    stage: str,
+    error_code: str,
+    error_summary: str,
+    suppressed: int,
+    task_id: str = "",
+    context: TaskFailureContext | None = None,
 ) -> str:
     lines = [
         "抖音火花控制台：任务执行失败",
@@ -239,6 +250,13 @@ def _build_failure_body(
         f"错误码：{error_code or '未提供'}",
         f"摘要：{error_summary or '无'}",
     ]
+    if context is not None:
+        if context.owner_username:
+            lines.append(f"控制台账号：{context.owner_username}")
+        if context.account_name:
+            lines.append(f"抖音账号：{context.account_name}")
+        if context.target_name:
+            lines.append(f"目标：{context.target_name}")
     if task_id:
         lines.append(f"任务：{task_id}")
     if error_code in COOKIE_RELATED_CODES:
@@ -268,9 +286,10 @@ def alert_task_failure(
     error_code: str = "",
     error_summary: str = "",
     task_id: str = "",
+    context: TaskFailureContext | None = None,
     settings: MailSettings | None = None,
 ) -> bool:
-    """任务失败的全局兜底告警：带冷却窗口、异步发送。任何异常都不向上冒泡。
+    """给任务主人发送失败通知：带冷却窗口、异步发送。任何异常都不向上冒泡。
 
     两类失败不在这里发：
 
@@ -281,18 +300,29 @@ def alert_task_failure(
     """
 
     try:
+        if context is None or not context.owner_user_id:
+            return False
         if error_code in USER_SCOPED_CODES:
             return False
         if error_code.startswith(RETRY_SCHEDULED_PREFIX):
             return False
+        if not context.recipient or not context.recipient.strip():
+            logger.warning("任务所属用户未填写通知邮箱，跳过失败通知")
+            return False
         settings = settings or MailSettings.from_environ(os.environ)
-        if not settings.configured or not settings.alert_recipients:
+        if not settings.configured:
             return False
 
         state = _read_state(settings)
         now = datetime.now(timezone.utc)
-        suppressed = int(state.get("suppressed") or 0)
-        last_raw = state.get("last_sent_at")
+        owners = state.get("owners")
+        if not isinstance(owners, dict):
+            owners = {}
+        owner_state = owners.get(context.owner_user_id)
+        if not isinstance(owner_state, dict):
+            owner_state = {}
+        suppressed = int(owner_state.get("suppressed") or 0)
+        last_raw = owner_state.get("last_sent_at")
 
         should_send = True
         if last_raw:
@@ -307,17 +337,23 @@ def alert_task_failure(
                 should_send = True
 
         if not should_send:
-            state["suppressed"] = suppressed + 1
+            owner_state["suppressed"] = suppressed + 1
+            owners[context.owner_user_id] = owner_state
+            state["owners"] = owners
             _write_state(settings, state)
             return False
 
         subject = f"【火花控制台】任务失败：{error_code or stage or '未知原因'}"
-        body = _build_failure_body(stage, error_code, error_summary, suppressed, task_id)
-        state["last_sent_at"] = now.isoformat()
-        state["suppressed"] = 0
+        body = _build_failure_body(
+            stage, error_code, error_summary, suppressed, task_id, context
+        )
+        owner_state["last_sent_at"] = now.isoformat()
+        owner_state["suppressed"] = 0
+        owners[context.owner_user_id] = owner_state
+        state["owners"] = owners
         _write_state(settings, state)
 
-        _send_async(settings, settings.alert_recipients, subject, body)
+        _send_async(settings, [context.recipient.strip()], subject, body)
         return True
     except Exception:  # noqa: BLE001 —— 通知是旁路，任何情况下都不能影响主流程
         logger.warning("告警通知流程异常（已忽略）")

@@ -23,7 +23,11 @@ from spark_console.models import (
     User,
     WorkerLock,
 )
-from spark_console.notify import MailSettings, notify_cookie_expired
+from spark_console.notify import (
+    MailSettings,
+    TaskFailureContext,
+    notify_cookie_expired,
+)
 from spark_console.scheduler import claim_next_due_task, finish_run
 from spark_console.services.accounts import AccountService
 from spark_console.services.audits import AuditService
@@ -103,6 +107,8 @@ class Worker:
                 )
             ).all()
             for run in interrupted:
+                task = db.get(SparkTask, run.task_id)
+                notification = self._failure_context(db, task) if task else None
                 finish_run(
                     run,
                     "failed",
@@ -110,8 +116,8 @@ class Worker:
                     self.started_at,
                     "worker_interrupted",
                     "执行器重启中断了任务，已安排 1 分钟后重试",
+                    notification,
                 )
-                task = db.get(SparkTask, run.task_id)
                 if task is not None and task.enabled:
                     task.next_run_at = retry_at
 
@@ -138,8 +144,17 @@ class Worker:
                 )
             )
             task = db.get(SparkTask, run.task_id)
+            notification = self._failure_context(db, task)
             if abs(self.clock_offset_seconds) > self.settings.clock_offset_limit_seconds:
-                return finish_run(run, "failed", "clock_check", current_time, "system_time_unhealthy", "服务器时间未同步")
+                return finish_run(
+                    run,
+                    "failed",
+                    "clock_check",
+                    current_time,
+                    "system_time_unhealthy",
+                    "服务器时间未同步",
+                    notification,
+                )
             scheduled = run.scheduled_for if run.scheduled_for.tzinfo else run.scheduled_for.replace(tzinfo=timezone.utc)
             admitted = (run.task_id, scheduled) in self._admitted_runs
             self._admitted_runs.discard((run.task_id, scheduled))
@@ -151,9 +166,18 @@ class Worker:
                     current_time,
                     "worker_was_offline",
                     "执行器离线期间任务已错过，未补发",
+                    notification,
                 )
             if not admitted and current_time - scheduled > self.ADMISSION_GRACE:
-                return finish_run(run, "skipped", "late", current_time, "missed_window", "任务未及时进入队列，或排队已超过 1 小时")
+                return finish_run(
+                    run,
+                    "skipped",
+                    "late",
+                    current_time,
+                    "missed_window",
+                    "任务未及时进入队列，或排队已超过 1 小时",
+                    notification,
+                )
             account_service = AccountService(db, self.cipher, AuditService(db))
             account = db.get(DouyinAccount, task.douyin_account_id)
             credential_version = account.cookie_version
@@ -210,6 +234,7 @@ class Worker:
                     datetime.now(timezone.utc),
                     "execution_timeout",
                     "页面操作超过 3 分钟，已终止本次执行",
+                    notification,
                 )
             elif result is None:
                 outcome = finish_run(
@@ -219,6 +244,7 @@ class Worker:
                     datetime.now(timezone.utc),
                     "unexpected_error",
                     "任务执行发生意外异常，Worker 已继续运行",
+                    notification,
                 )
             else:
                 if result.success:
@@ -247,6 +273,7 @@ class Worker:
                         datetime.now(timezone.utc),
                         result.error_code,
                         result.error_summary,
+                        notification,
                     )
                 )
             if result is not None and (
@@ -278,6 +305,22 @@ class Worker:
             newest = newest.replace(tzinfo=timezone.utc)
         return now - newest > self.snapshot_max_age
 
+    @staticmethod
+    def _failure_context(db, task: SparkTask | None) -> TaskFailureContext | None:
+        if task is None:
+            return None
+        owner = db.get(User, task.owner_user_id)
+        account = db.get(DouyinAccount, task.douyin_account_id) if task.douyin_account_id else None
+        if owner is None:
+            return None
+        return TaskFailureContext(
+            owner_user_id=owner.id,
+            recipient=owner.email,
+            owner_username=owner.username,
+            account_name=account.display_name if account else "",
+            target_name=task.target_name,
+        )
+
     def _mark_cookie_invalid(
         self, db, account_id: str
     ) -> tuple[str | None, str, str] | None:
@@ -285,7 +328,7 @@ class Worker:
 
         只有在该号由「非失效」变为「失效」时才返回，避免每天定时任务把同一封
         失效邮件反复发出去。所属用户没填邮箱时收件人为 None，
-        由 notify 层兜底发给运维收件人。
+        由 notify 层跳过发送，避免发给其他控制台账号。
         """
 
         row = db.execute(
@@ -363,10 +406,11 @@ class Worker:
                 run,
                 "failed",
                 stage,
-                datetime.now(timezone.utc),
-                code,
-                f"发送前遇到临时故障，已安排 {minutes} 分钟后重试",
-            )
+                    datetime.now(timezone.utc),
+                    code,
+                    f"发送前遇到临时故障，已安排 {minutes} 分钟后重试",
+                    self._failure_context(db, task),
+                )
         return None
 
 

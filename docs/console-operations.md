@@ -141,10 +141,10 @@ docker compose -f compose.console.yml ps
 每个控制台账号在注册时必须填写**自己的通知邮箱**（`users.email`）。账号下绑定的抖音号各不相同，所以提醒邮件只发给该抖音号所属的用户本人，不存在全局群发。
 
 - 触发点：Worker 执行任务时，抖音号返回 `cookie_invalid`，账号状态由「正常」变为「需要重新登录」。再次执行时不会重复发送，避免每天轰炸。
-- 兜底：该抖音号所属用户尚未填写邮箱（例如 `import-legacy` 导入的旧账号）时，改发给 `SPARK_ALERT_EMAIL_TO`，不会静默丢提醒。
+- 未填写邮箱：该抖音号所属用户没有通知邮箱时跳过发送，不转发给其他控制台账号。
 - SMTP 未配置时跳过发送，且绝不影响任务执行与重试。
 
-同一套 SMTP 还承担**其他任务失败的全局告警**（`alert_task_failure`）：**最终失败**会在**冷却窗口**（`SPARK_ALERT_COOLDOWN_MINUTES`，默认 60 分钟）内最多发一封给 `SPARK_ALERT_EMAIL_TO`，邮件正文带**任务 ID**（可直接拿它查 `task_runs` 定位是哪个任务），其余只计入「已抑制」，窗口过后下一封会带上被抑制的条数。两类失败不进这条路径：`cookie_invalid` 已经按用户发给本人，不再重复；`retry_scheduled_*` 只是「已安排 1 分钟 / 5 分钟自动重试」的**中间态**（Worker 自己还会再试，此时告警只会变成误报噪音），等重试跑完仍然失败时，最后那次会带**真实错误码**走到这里，该发的告警一封都不会少。
+同一套 SMTP 还承担**任务失败告警**（`alert_task_failure`）：**最终失败**会在**每个任务主人的冷却窗口**（`SPARK_ALERT_COOLDOWN_MINUTES`，默认 60 分钟）内最多发一封给该任务主人的 `users.email`，邮件正文带控制台账号、抖音账号、目标和**任务 ID**。没有主人邮箱时跳过发送，不会发给 `SPARK_ALERT_EMAIL_TO`。两类失败不进这条路径：`cookie_invalid` 已经按用户发给本人，不再重复；`retry_scheduled_*` 只是「已安排 1 分钟 / 5 分钟自动重试」的**中间态**（Worker 自己还会再试，此时告警只会变成误报噪音），等重试跑完仍然失败时，最后那次会带**真实错误码**走到这里，该发的告警一封都不会少。
 
 在 `.env.console` 中填写发件邮箱（以 163 邮箱为例，授权码不是登录密码）：
 
@@ -155,7 +155,7 @@ SPARK_SMTP_SECURITY=ssl
 SPARK_SMTP_USER=发件邮箱@163.com
 SPARK_SMTP_PASSWORD=邮箱授权码
 SPARK_SMTP_FROM=
-SPARK_ALERT_EMAIL_TO=运维收件人@qq.com
+SPARK_ALERT_EMAIL_TO=独立测试邮件收件人@qq.com
 SPARK_ALERT_COOLDOWN_MINUTES=60
 ```
 

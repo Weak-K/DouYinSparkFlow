@@ -301,7 +301,7 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 engine.dispose()
 
-    async def test_worker_defers_to_the_ops_fallback_when_the_owner_has_no_email(self):
+    async def test_worker_skips_cookie_alert_when_the_owner_has_no_email(self):
         now = datetime(2026, 8, 25, 1, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -331,7 +331,7 @@ class WorkerCredentialTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     ).run_once(now)
 
-                # 收件人为 None：由 notify 层兜底发给运维收件人，而不是静默丢失提醒。
+                # 没有主人邮箱时不转发给其他账号，避免跨账号泄露。
                 self.assertEqual(1, sender.call_count)
                 self.assertIsNone(sender.call_args.args[1])
                 with Session(engine) as session:

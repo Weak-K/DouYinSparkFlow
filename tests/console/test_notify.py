@@ -13,6 +13,7 @@ from spark_console.notify import (
     notify_cookie_expired,
     parse_recipients,
     send_mail,
+    TaskFailureContext,
 )
 
 
@@ -167,9 +168,11 @@ class CookieAlertTests(unittest.TestCase):
         self.assertIn("friend", body)
         self.assertIn("重新扫码绑定", body)
 
-    def test_cookie_alert_falls_back_to_ops_recipients_without_a_user_address(self):
-        with patch("spark_console.notify.send_mail", return_value=True) as sender:
-            notify_cookie_expired(
+    def test_cookie_alert_without_owner_email_never_falls_back_to_ops(self):
+        with self.assertLogs("spark.notify", level="WARNING"), patch(
+            "spark_console.notify.send_mail"
+        ) as sender:
+            sent = notify_cookie_expired(
                 CONFIGURED,
                 None,
                 owner_username="legacy-owner",
@@ -177,9 +180,8 @@ class CookieAlertTests(unittest.TestCase):
                 occurred_at="2026-09-20 09:00:00 CST",
             )
 
-        recipients, _subject, body = sender.call_args.args[1:]
-        self.assertEqual(list(ALERTS), recipients)
-        self.assertIn("尚未填写通知邮箱", body)
+        self.assertFalse(sent)
+        sender.assert_not_called()
 
     def test_cookie_alert_is_skipped_when_no_address_is_available_at_all(self):
         with self.assertLogs("spark.notify", level="WARNING"), patch(
@@ -222,12 +224,32 @@ class TaskFailureAlertTests(unittest.TestCase):
             data_dir=self.temp.name,
         )
 
+    def alert(self, **kwargs):
+        options = dict(
+            recipient="owner@example.com",
+            owner_user_id="owner-1",
+            owner_username="owner",
+            account_name="My account",
+            target_name="Target",
+            settings=self.settings,
+        )
+        options.update(kwargs)
+        context = TaskFailureContext(
+            owner_user_id=options.pop("owner_user_id"),
+            recipient=options.pop("recipient"),
+            owner_username=options.pop("owner_username"),
+            account_name=options.pop("account_name"),
+            target_name=options.pop("target_name"),
+        )
+        options["context"] = context
+        return alert_task_failure(**options)
+
     def tearDown(self):
         self.temp.cleanup()
 
     def test_cookie_invalid_is_left_to_the_per_user_notification(self):
         with patch("spark_console.notify._send_async") as dispatcher:
-            sent = alert_task_failure(
+            sent = self.alert(
                 stage="authenticating", error_code="cookie_invalid", settings=self.settings
             )
 
@@ -238,14 +260,14 @@ class TaskFailureAlertTests(unittest.TestCase):
         """「已安排自动重试」只是中间态，不该发全局告警，也不该占用冷却窗口。"""
 
         with patch("spark_console.notify._send_async") as dispatcher:
-            one_minute = alert_task_failure(
+            one_minute = self.alert(
                 stage="selecting_target",
                 error_code="retry_scheduled_1m",
                 error_summary="发送前遇到临时故障，已安排 1 分钟后重试",
                 task_id="task-1",
                 settings=self.settings,
             )
-            five_minutes = alert_task_failure(
+            five_minutes = self.alert(
                 stage="selecting_target",
                 error_code="retry_scheduled_5m",
                 settings=self.settings,
@@ -261,7 +283,7 @@ class TaskFailureAlertTests(unittest.TestCase):
         """重试机会用尽后的最终失败必须照发，别被上面的过滤误伤。"""
 
         with patch("spark_console.notify._send_async") as dispatcher:
-            sent = alert_task_failure(
+            sent = self.alert(
                 stage="selecting_target",
                 error_code="conversation_not_opened",
                 error_summary="已找到好友，但聊天窗口没有打开",
@@ -274,42 +296,82 @@ class TaskFailureAlertTests(unittest.TestCase):
         self.assertIn("conversation_not_opened", body)
         self.assertIn("6fb1ff75-be90-4000-a054-5745a1204b03", body)
 
-    def test_other_failures_notify_ops_recipients(self):
+    def test_other_failures_notify_only_the_task_owner(self):
         with patch("spark_console.notify._send_async") as dispatcher:
-            sent = alert_task_failure(
+            sent = self.alert(
                 stage="navigation", error_code="network_unavailable", settings=self.settings
             )
 
         self.assertTrue(sent)
         _settings, recipients, subject, body = dispatcher.call_args.args
-        self.assertEqual(ALERTS, tuple(recipients))
+        self.assertEqual(("owner@example.com",), tuple(recipients))
         self.assertIn("network_unavailable", subject)
         self.assertIn("navigation", body)
+        self.assertIn("owner", body)
+        self.assertIn("My account", body)
+        self.assertIn("Target", body)
 
     def test_repeated_failures_inside_the_cooldown_are_suppressed(self):
         with patch("spark_console.notify._send_async") as dispatcher:
-            first = alert_task_failure(error_code="network_unavailable", settings=self.settings)
-            second = alert_task_failure(error_code="network_unavailable", settings=self.settings)
+            first = self.alert(error_code="network_unavailable")
+            second = self.alert(error_code="network_unavailable")
 
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertEqual(1, dispatcher.call_count)
         state = json.loads((Path(self.temp.name) / "alert-state.json").read_text("utf-8"))
-        self.assertEqual(1, state["suppressed"])
+        self.assertEqual(1, state["owners"]["owner-1"]["suppressed"])
 
         with patch("spark_console.notify._send_async") as dispatcher:
-            third = alert_task_failure(error_code="network_unavailable", settings=self.settings)
+            third = self.alert(error_code="network_unavailable")
         self.assertFalse(third)
         self.assertEqual(0, dispatcher.call_count)
 
     def test_unconfigured_settings_never_dispatch(self):
         with patch("spark_console.notify._send_async") as dispatcher:
-            sent = alert_task_failure(
+            sent = self.alert(
                 error_code="network_unavailable", settings=MailSettings()
             )
 
         self.assertFalse(sent)
         dispatcher.assert_not_called()
+
+    def test_owner_without_email_is_not_redirected_to_global_recipients(self):
+        for recipient in (None, "", "   "):
+            with self.subTest(recipient=recipient), patch("spark_console.notify._send_async") as dispatcher:
+                self.assertFalse(self.alert(recipient=recipient, error_code="wrong_conversation_opened"))
+                dispatcher.assert_not_called()
+        self.assertFalse((Path(self.temp.name) / "alert-state.json").exists())
+
+    def test_missing_owner_context_does_not_send_a_global_alert(self):
+        with patch("spark_console.notify._send_async") as dispatcher:
+            self.assertFalse(alert_task_failure(error_code="unexpected_error", settings=self.settings))
+            self.assertFalse(self.alert(owner_user_id="", error_code="unexpected_error"))
+            dispatcher.assert_not_called()
+
+    def test_task_alert_works_without_global_recipients(self):
+        with patch("spark_console.notify._send_async") as dispatcher:
+            self.assertTrue(self.alert(settings=self.settings))
+        self.assertEqual(["owner@example.com"], dispatcher.call_args.args[1])
+
+    def test_cooldown_and_suppressed_counts_are_isolated_by_owner(self):
+        with patch("spark_console.notify._send_async") as dispatcher:
+            self.assertTrue(self.alert())
+            self.assertFalse(self.alert())
+            self.assertTrue(self.alert(owner_user_id="owner-2", recipient="other@example.com"))
+        self.assertEqual(2, dispatcher.call_count)
+        self.assertEqual(["other@example.com"], dispatcher.call_args.args[1])
+        self.assertNotIn("已被抑制", dispatcher.call_args.args[3])
+        state = json.loads((Path(self.temp.name) / "alert-state.json").read_text("utf-8"))
+        self.assertEqual(1, state["owners"]["owner-1"]["suppressed"])
+        self.assertEqual(0, state["owners"]["owner-2"]["suppressed"])
+
+    def test_legacy_global_cooldown_does_not_suppress_an_owner(self):
+        state_path = Path(self.temp.name) / "alert-state.json"
+        state_path.write_text(json.dumps({"last_sent_at": "2099-01-01T00:00:00+00:00", "suppressed": 9}))
+        with patch("spark_console.notify._send_async") as dispatcher:
+            self.assertTrue(self.alert())
+        self.assertNotIn("9 条", dispatcher.call_args.args[3])
 
 
 if __name__ == "__main__":
