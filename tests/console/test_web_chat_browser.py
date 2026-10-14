@@ -76,7 +76,9 @@ class WebChatBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Target", discovered)
 
     async def test_search_response_later_than_three_seconds_is_still_accepted(self):
-        await self.page.set_content("<div id='results'></div>")
+        await self.page.set_content(
+            '<div class="SearchPanelitembox"><div class="SearchPanelitemtitle" id="results"></div></div>'
+        )
         await self.page.evaluate("""() => {
           setTimeout(() => {
             document.querySelector('#results').textContent = 'Delayed target';
@@ -108,7 +110,7 @@ class WebChatBrowserTests(unittest.IsolatedAsyncioTestCase):
           });
         }""")
 
-        async def no_results(_page, field, candidate, _timeout):
+        async def no_results(_page, field, candidate, _timeout, **_kwargs):
             await field.fill(candidate)
             return []
 
@@ -117,6 +119,140 @@ class WebChatBrowserTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(chat.TargetNotFoundError):
                 await chat.select_web_chat_target(self.page, "Absent", timeout=1000)
         self.assertEqual("", await self.page.locator("input").input_value())
+
+    async def search_fixture(self, items):
+        await self.page.set_content('''
+          <input placeholder="搜索"><div id="results"></div>
+          <script>window.selected = null;</script>
+        ''')
+        for title_html, chosen in items:
+            await self.page.locator("#results").evaluate("""(el, item) => {
+              const row = document.createElement('div');
+              row.className = 'SearchPanelitembox';
+              row.innerHTML = '<div class="SearchPanelitemtitle">' + item[0] + '</div>';
+              row.onclick = () => { window.selected = item[1]; };
+              el.append(row);
+            }""", [title_html, chosen])
+
+    async def test_ignores_highlight_substring_and_clicks_only_full_title(self):
+        await self.search_fixture([
+            ('<span class="SearchPanelitemsearch_highlight">Target</span>-Other', 'wrong'),
+            ('<span class="SearchPanelitemsearch_highlight">Target</span>', 'right'),
+        ])
+        self.assertEqual("Target", await chat.select_web_chat_target(self.page, "Target"))
+        self.assertEqual("right", await self.page.evaluate("window.selected"))
+
+    async def test_partial_name_or_unrelated_page_text_never_counts_as_result(self):
+        await self.search_fixture([
+            ('<span class="SearchPanelitemsearch_highlight">Target</span>-Other', 'wrong'),
+        ])
+        await self.page.evaluate("""() => {
+          document.body.insertAdjacentHTML('beforeend',
+            '<div class="RightPanelHeadertitle">Target</div>' +
+            '<div class="SearchPanelitemtitle">Target</div>' +
+            '<div class="messageMessageBoxmessageBox">Target</div>');
+        }""")
+        self.assertEqual([], await chat._wait_for_visible_search_results(self.page, "Target", 50))
+        with self.assertRaises(TimeoutError):
+            await chat.select_web_chat_target(self.page, "Target", timeout=250)
+        self.assertIsNone(await self.page.evaluate("window.selected"))
+
+    async def test_hidden_duplicate_does_not_block_unique_visible_result(self):
+        await self.search_fixture([('Target', 'hidden'), ('Target', 'right')])
+        await self.page.locator(chat.SEARCH_RESULT_SELECTOR).first.evaluate(
+            "el => { el.style.display = 'none'; }"
+        )
+        await chat.select_web_chat_target(self.page, "Target")
+        self.assertEqual("right", await self.page.evaluate("window.selected"))
+
+    async def test_duplicate_full_titles_abort_without_clicking(self):
+        await self.search_fixture([('Target', 'first'), ('Target', 'second')])
+        with self.assertRaises(chat.AmbiguousTargetError):
+            await chat.select_web_chat_target(self.page, "Target")
+        self.assertIsNone(await self.page.evaluate("window.selected"))
+
+    async def test_multiple_alias_matches_abort_without_clicking(self):
+        await self.search_fixture([('Old name', 'first'), ('Current name', 'second')])
+        with self.assertRaises(chat.AmbiguousTargetError):
+            await chat.select_web_chat_target(self.page, "Old name", aliases=("Current name",))
+        self.assertIsNone(await self.page.evaluate("window.selected"))
+
+    async def test_result_reorder_cannot_change_clicked_recipient(self):
+        await self.search_fixture([('Target', 'right'), ('Other', 'wrong')])
+        result = (await chat._wait_for_visible_search_results(self.page, "Target", 50))[0]
+        await self.page.locator("#results").evaluate("el => el.prepend(el.lastElementChild)")
+        self.assertTrue(await chat._click_search_result(self.page, result, ("Target",)))
+        self.assertEqual("right", await self.page.evaluate("window.selected"))
+
+    async def test_renamed_result_is_not_clicked_using_its_old_position(self):
+        await self.search_fixture([('Target', 'wrong')])
+        result = (await chat._wait_for_visible_search_results(self.page, "Target", 50))[0]
+        await self.page.locator(chat.SEARCH_RESULT_TITLE_SELECTOR).evaluate(
+            "el => { el.textContent = 'Other'; }"
+        )
+        self.assertFalse(await chat._click_search_result(self.page, result, ("Target",)))
+        self.assertIsNone(await self.page.evaluate("window.selected"))
+
+    async def test_new_duplicate_before_click_is_rejected(self):
+        await self.search_fixture([('Target', 'wrong')])
+        result = (await chat._wait_for_visible_search_results(self.page, "Target", 50))[0]
+        await self.page.locator("#results").evaluate("el => el.append(el.firstChild.cloneNode(true))")
+        with self.assertRaises(chat.AmbiguousTargetError):
+            await chat._click_search_result(self.page, result, ("Target",))
+        self.assertIsNone(await self.page.evaluate("window.selected"))
+
+    async def test_send_message_button_is_scoped_to_matched_item(self):
+        await self.search_fixture([('Target', 'right'), ('Other', 'wrong')])
+        await self.page.locator(chat.SEARCH_RESULT_SELECTOR).last.evaluate("""el => {
+          el.insertAdjacentHTML('beforeend', '<button>发消息</button>');
+        }""")
+        await chat.select_web_chat_target(self.page, "Target")
+        self.assertEqual("right", await self.page.evaluate("window.selected"))
+
+    async def test_nested_send_message_button_in_matched_item_is_clicked(self):
+        await self.search_fixture([('Target', 'wrong-row')])
+        await self.page.locator(chat.SEARCH_RESULT_SELECTOR).evaluate("""el => {
+          el.insertAdjacentHTML('beforeend', '<button><span>发消息</span></button>');
+          el.querySelector('button').onclick = event => {
+            event.stopPropagation(); window.selected = 'right-button';
+          };
+        }""")
+        await chat.select_web_chat_target(self.page, "Target")
+        self.assertEqual("right-button", await self.page.evaluate("window.selected"))
+
+    async def test_known_full_nickname_is_accepted_for_identifier_search(self):
+        await self.search_fixture([('Current name', 'right')])
+        await chat.select_web_chat_target(
+            self.page, "Old name", aliases=("stable-handle", "Current name")
+        )
+        self.assertEqual("stable-handle", await self.page.locator("input").input_value())
+        self.assertEqual("right", await self.page.evaluate("window.selected"))
+
+    async def test_search_normalizes_whitespace_but_not_case(self):
+        await self.search_fixture([('target', 'wrong'), ('Target&nbsp;Name', 'right')])
+        self.assertEqual([], await chat._wait_for_visible_search_results(self.page, "Target", 50))
+        await chat.select_web_chat_target(self.page, "Target Name")
+        self.assertEqual("right", await self.page.evaluate("window.selected"))
+
+    async def test_header_switch_after_two_seconds_is_waited_for(self):
+        await self.page.set_content('<div class="RightPanelHeadertitle">Previous</div>')
+        await self.page.evaluate("""() => {
+          setTimeout(() => {
+            document.querySelector('.RightPanelHeadertitle').textContent = 'Target';
+          }, 2300);
+        }""")
+        self.assertEqual("Target", await chat.wait_for_opened_conversation(self.page, ("Target",)))
+
+    async def test_hidden_or_ambiguous_headers_are_not_accepted(self):
+        await self.page.set_content('''
+          <div class="RightPanelHeadertitle" style="display:none">Target</div>
+          <div class="RightPanelHeadertitle">Other</div>
+        ''')
+        self.assertEqual("Other", await chat.opened_conversation_title(self.page))
+        await self.page.locator(chat.CONVERSATION_HEADER_SELECTOR).first.evaluate(
+            "el => { el.style.display = 'block'; }"
+        )
+        self.assertEqual("", await chat.opened_conversation_title(self.page))
 
 
 if __name__ == "__main__":

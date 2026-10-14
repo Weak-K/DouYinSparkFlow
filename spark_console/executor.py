@@ -7,6 +7,7 @@ from enum import StrEnum
 from core.web_chat import (
     CHAT_EDITOR_SELECTOR,
     WEB_CHAT_URL,
+    AmbiguousTargetError,
     TargetNotFoundError,
     UserInfoCollector,
     matches_opened_conversation,
@@ -106,14 +107,19 @@ class DouyinExecutor:
                         page, (target, *aliases)
                     )
                     if not matches_opened_conversation(opened, (target, *aliases)):
-                        logger.warning(
-                            "opened conversation does not match the target stage=selecting_target"
+                        code = (
+                            "wrong_conversation_opened"
+                            if opened else "conversation_title_unavailable"
                         )
+                        logger.warning("conversation_guard stage=selecting_target status=%s", code)
                         return ExecutionResult(
                             False,
                             ExecutionStage.SELECTING_TARGET,
-                            "wrong_conversation_opened",
-                            "打开的会话与目标不一致，已中止发送",
+                            code,
+                            (
+                                "打开的会话与目标不一致，已中止发送"
+                                if opened else "未能读取唯一的会话标题，已中止发送"
+                            ),
                             retryable=True,
                             discovered_names=tuple(discovered),
                         )
@@ -152,6 +158,15 @@ class DouyinExecutor:
                             await context.close()
                     finally:
                         await browser.close()
+        except AmbiguousTargetError:
+            return ExecutionResult(
+                False,
+                ExecutionStage.SELECTING_TARGET,
+                "target_ambiguous",
+                "多个搜索结果的完整标题与目标相符，已中止发送",
+                retryable=False,
+                discovered_names=tuple(discovered),
+            )
         except TargetNotFoundError:
             return ExecutionResult(
                 False,
@@ -174,7 +189,7 @@ class DouyinExecutor:
                     False,
                     ExecutionStage.SELECTING_TARGET,
                     "conversation_not_opened",
-                    "已找到好友，但聊天窗口没有打开",
+                    "选人或打开聊天窗口失败，尚未发送消息",
                     retryable=True,
                     discovered_names=tuple(discovered),
                 )

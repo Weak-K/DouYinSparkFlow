@@ -21,6 +21,10 @@ SEARCH_INPUT_SELECTORS = (
     'input[placeholder="搜索"]',
     'input[placeholder*="搜索"]',
 )
+# 只在搜索条目的完整标题上匹配；高亮 span 的文字可能只是另一个人名字的一部分。
+SEARCH_RESULT_SELECTOR = ".SearchPanelitembox"
+SEARCH_RESULT_TITLE_SELECTOR = ".SearchPanelitemtitle"
+OPENED_CONVERSATION_TIMEOUT_MS = 5000
 
 # 零宽字符在页面上看不见，却会让 `==` 失配（历史上出现过 \u00a0 与普通空格并存）。
 _INVISIBLE_CHARACTERS = dict.fromkeys(
@@ -141,6 +145,10 @@ class TargetNotFoundError(RuntimeError):
     """Raised when the requested friend is absent from the web chat list."""
 
 
+class AmbiguousTargetError(RuntimeError):
+    """多个完整标题相符时安全失败，不按页面顺序猜收件人。"""
+
+
 async def list_visible_web_chat_targets(page, timeout=30000):
     """Return unique, visible conversation titles from the signed-in chat list."""
     await page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=timeout)
@@ -248,42 +256,70 @@ async def collect_web_chat_conversation_names(
     return tuple(row.title for row in rows)
 
 
-async def _click_search_result(result) -> None:
-    try:
-        send_button = result.locator(
-            "xpath=ancestor::*[.//*[normalize-space()='发消息']][1]"
-            "//*[normalize-space()='发消息' and "
-            "not(.//*[normalize-space()='发消息'])]"
-        )
-        if await send_button.count() > 0 and await send_button.is_visible():
-            await send_button.click()
-            return
-    except (AttributeError, TypeError):
-        pass
-    await result.click()
+def _search_result_locator(page, title):
+    # 不保留 all()/nth() 的位置：列表异步重排后仍必须定位同一个完整标题。
+    title_locator = page.locator(SEARCH_RESULT_TITLE_SELECTOR).filter(
+        has_text=re.compile(r"^\s*" + re.escape(title) + r"\s*$")
+    )
+    return page.locator(SEARCH_RESULT_SELECTOR + ":visible").filter(has=title_locator)
 
 
-async def _wait_for_visible_search_results(page, candidate, timeout_ms):
+async def _matching_search_results(page, candidates):
+    accepted = {normalize_target_name(value) for value in candidates if value}
+    matches = []
+    for item in await page.locator(SEARCH_RESULT_SELECTOR + ":visible").all():
+        titles = item.locator(SEARCH_RESULT_TITLE_SELECTOR)
+        if await titles.count() != 1 or not await titles.is_visible():
+            continue
+        title = (await titles.inner_text()).strip()
+        if title and normalize_target_name(title) in accepted:
+            matches.append(ConversationRow(title, _search_result_locator(page, title)))
+    if len(matches) > 1:
+        logger.warning("target_selection path=search status=ambiguous")
+        raise AmbiguousTargetError("ambiguous_search_results")
+    return matches
+
+
+async def _click_search_result(page, result, candidates) -> bool:
+    # 点击前重读完整条目；新出现的重名 / 别名歧义不能靠取 first 掩盖。
+    current = await _matching_search_results(page, candidates)
+    if len(current) != 1 or current[0].title != result.title:
+        logger.info("target_selection path=search status=result_changed")
+        return False
+    item = current[0].locator
+    if await item.count() != 1:
+        return False
+    # 按钮仅能来自当前条目，禁止向上攀到整个结果面板后点击别人的按钮。
+    send_button = item.locator(
+        "xpath=.//*[normalize-space()='发消息' and "
+        "not(.//*[normalize-space()='发消息'])]"
+    )
+    count = await send_button.count()
+    if count > 1:
+        raise AmbiguousTargetError("ambiguous_search_action")
+    if count == 1 and await send_button.is_visible():
+        await send_button.click()
+    else:
+        await item.click()
+    logger.info("target_selection path=search status=clicked")
+    return True
+
+
+async def _wait_for_visible_search_results(page, candidate, timeout_ms, *, candidates=()):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0, timeout_ms / 1000)
+    accepted = (candidate, *candidates)
     while True:
-        exact = page.get_by_text(candidate, exact=True)
-        if await exact.count() > 0:
-            results = await exact.all() if hasattr(exact, "all") else [exact.first]
-            visible = []
-            for result in results:
-                if hasattr(result, "is_visible") and not await result.is_visible():
-                    continue
-                visible.append(result)
-            if visible:
-                return visible
+        results = await _matching_search_results(page, accepted)
+        if results:
+            return results
         remaining = deadline - loop.time()
         if remaining <= 0:
             return []
         await asyncio.sleep(min(0.2, remaining))
 
 
-async def _search_in_panel(page, field, candidate, timeout_ms):
+async def _search_in_panel(page, field, candidate, timeout_ms, *, candidates=()):
     """在搜索框里搜一个候选，返回可见的精确文本结果（可能为空列表）。
 
     抖音搜索面板存在**冷启动不出结果**的行为：同一个页面上的第一次输入，结果
@@ -304,7 +340,9 @@ async def _search_in_panel(page, field, candidate, timeout_ms):
         await field.fill(candidate)
         # 冷启动先短等一次，重搜后给慢响应更多时间；外层限制整个选人预算。
         wait_ms = min(timeout_ms / (SEARCH_COLD_START_RETRIES + 1), 3000 if attempt == 0 else 8000)
-        results = await _wait_for_visible_search_results(page, candidate, wait_ms)
+        results = await _wait_for_visible_search_results(
+            page, candidate, wait_ms, candidates=candidates
+        )
         if results:
             return results
     return []
@@ -319,10 +357,10 @@ async def opened_conversation_title(page) -> str:
     """
 
     try:
-        locator = page.locator(CONVERSATION_HEADER_SELECTOR)
-        if await locator.count() == 0:
+        locator = page.locator(CONVERSATION_HEADER_SELECTOR + ":visible")
+        if await locator.count() != 1:
             return ""
-        return (await locator.first.inner_text()).strip()
+        return (await locator.inner_text(timeout=500)).strip()
     except Exception:  # noqa: BLE001 —— 校验读取失败一律按「读不到」处理
         return ""
 
@@ -339,7 +377,7 @@ def matches_opened_conversation(opened_title: str, candidates) -> bool:
 
 
 async def wait_for_opened_conversation(
-    page, candidates, timeout_ms: int = 2000
+    page, candidates, timeout_ms: int = OPENED_CONVERSATION_TIMEOUT_MS
 ) -> str:
     """等待聊天区标题切换到本次选中的目标，避免读到上一个会话的旧标题。"""
 
@@ -411,6 +449,7 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
     remember(rows)
     for row in rows:
         if row.title in raw_candidates and await _click_conversation_row(page, row):
+            logger.info("target_selection path=conversation status=clicked")
             return row.title
 
     for selector in SEARCH_INPUT_SELECTORS:
@@ -420,10 +459,12 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
                 continue
             field = search.first
             for candidate in raw_candidates:
-                results = await _search_in_panel(page, field, candidate, timeout)
+                results = await _search_in_panel(
+                    page, field, candidate, timeout, candidates=raw_candidates
+                )
                 for result in results:
-                    await _click_search_result(result)
-                    return candidate
+                    if await _click_search_result(page, result, raw_candidates):
+                        return result.title
             # 搜索结果会覆盖左栏，必须退出搜索再检查会话，不能在搜索态白等列表。
             await field.fill("")
             break
@@ -438,6 +479,7 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
 
     for row in rows:
         if row.title in raw_candidates and await _click_conversation_row(page, row):
+            logger.info("target_selection path=conversation_after_search status=clicked")
             return row.title
 
     # 精确名全没命中时，只放宽「零宽字符/空白差异」，绝不放宽大小写，
@@ -447,6 +489,7 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
             normalize_target_name(row.title) in folded_candidates
             and await _click_conversation_row(page, row)
         ):
+            logger.info("target_selection path=conversation_normalized status=clicked")
             return row.title
 
     raise TargetNotFoundError(f"未在抖音聊天列表中找到好友 {normalized_target}")

@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from spark_console.credentials import CredentialError, CredentialPayload
 from spark_console.executor import DouyinExecutor
@@ -425,13 +425,14 @@ class _FakePage:
 class _FakeEditor:
     def __init__(self):
         self.pressed = []
+        self.typed = []
 
     @property
     def first(self):
         return self
 
-    async def type(self, _value):
-        return None
+    async def type(self, value):
+        self.typed.append(value)
 
     async def press(self, key):
         self.pressed.append(key)
@@ -450,7 +451,7 @@ class _FakeHeader:
     async def count(self):
         return 1
 
-    async def inner_text(self):
+    async def inner_text(self, **_kwargs):
         return self.title
 
 
@@ -703,7 +704,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual("selecting_target", result.stage)
         self.assertEqual("conversation_not_opened", result.error_code)
-        self.assertEqual("已找到好友，但聊天窗口没有打开", result.error_summary)
+        self.assertEqual("选人或打开聊天窗口失败，尚未发送消息", result.error_summary)
         self.assertTrue(result.retryable)
 
     async def test_executor_refuses_when_a_different_conversation_is_open(self):
@@ -738,11 +739,55 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
             result = await DouyinExecutor().execute(raw, "目标", "消息")
 
         self.assertEqual([], page.editor.pressed)
+        self.assertEqual([], page.editor.typed)
         self.assertFalse(result.success)
         self.assertEqual("selecting_target", result.stage)
         self.assertEqual("wrong_conversation_opened", result.error_code)
         # 不会发送到错误会话；刷新浏览器后允许重新选人重试。
         self.assertTrue(result.retryable)
+
+    async def test_executor_reports_missing_title_separately_without_typing(self):
+        result, page = await self._execute_guard_failure("")
+        self.assertEqual("conversation_title_unavailable", result.error_code)
+        self.assertEqual("未能读取唯一的会话标题，已中止发送", result.error_summary)
+        self.assertTrue(result.retryable)
+        self.assertEqual([], page.editor.typed)
+        self.assertEqual([], page.editor.pressed)
+
+    async def test_executor_rejects_ambiguous_selection_without_retry_or_typing(self):
+        from core.web_chat import AmbiguousTargetError
+
+        result, page = await self._execute_guard_failure(
+            "Target", AmbiguousTargetError("ambiguous_search_results")
+        )
+        self.assertEqual("target_ambiguous", result.error_code)
+        self.assertFalse(result.retryable)
+        self.assertEqual([], page.editor.typed)
+        self.assertEqual([], page.editor.pressed)
+
+    async def _execute_guard_failure(self, title, selection_error=None):
+        page = _FakeSendingPage(opened_title=title)
+        browser = _FakeBrowser()
+        browser.context.new_page = AsyncMock(return_value=page)
+        api = ModuleType("playwright.async_api")
+        api.async_playwright = lambda: _FakePlaywrightManager(browser)
+        playwright = ModuleType("playwright")
+        playwright.async_api = api
+        core_tasks = ModuleType("core.tasks")
+        core_tasks.confirm_message_sent = AsyncMock()
+        raw = b'[{"name":"sid","value":"guard-test","domain":".douyin.com","path":"/"}]'
+        with patch.dict("sys.modules", {
+            "playwright": playwright,
+            "playwright.async_api": api,
+            "core.tasks": core_tasks,
+        }), patch("spark_console.executor.select_web_chat_target", AsyncMock(
+            return_value="Target", side_effect=selection_error
+        )), patch("spark_console.executor.wait_for_opened_conversation", AsyncMock(return_value=title)):
+            result = await DouyinExecutor().execute(raw, "Target", "Message")
+        core_tasks.confirm_message_sent.assert_not_awaited()
+        self.assertFalse(result.success)
+        self.assertEqual(1, browser.close_count)
+        return result, page
 
     async def test_executor_resolves_current_alias_from_stable_identity(self):
         page = _FakeIdentityPage()

@@ -2,6 +2,9 @@ import unittest
 
 from core.web_chat import (
     CONVERSATION_LIST_SELECTOR,
+    SEARCH_RESULT_SELECTOR,
+    SEARCH_RESULT_TITLE_SELECTOR,
+    AmbiguousTargetError,
     TargetNotFoundError,
     UserInfoCollector,
     collect_web_chat_conversation_names,
@@ -75,6 +78,108 @@ class FakeWebChatPage:
         return FakeConversationList(self.items)
 
 
+class FakeSearchField:
+    def __init__(self):
+        self.first = self
+        self.fills = []
+
+    async def count(self):
+        return 1
+
+    async def fill(self, value):
+        self.fills.append(value)
+
+
+class FakeSearchTitle(FakeTitle):
+    async def count(self):
+        return 1
+
+    async def is_visible(self):
+        return True
+
+
+class FakeSendButton:
+    def __init__(self, present=False):
+        self.present = present
+        self.clicked = False
+
+    async def count(self):
+        return int(self.present)
+
+    async def is_visible(self):
+        return self.present
+
+    async def click(self):
+        self.clicked = True
+
+
+class FakeSearchItem(FakeConversation):
+    def __init__(self, title, visible=True, send_button=False):
+        super().__init__(title, visible)
+        self.send_button = FakeSendButton(send_button)
+
+    def locator(self, selector):
+        if selector == SEARCH_RESULT_TITLE_SELECTOR:
+            return FakeSearchTitle(self.title)
+        assert selector.startswith("xpath=.//*")
+        return self.send_button
+
+
+class FakeSearchResults:
+    def __init__(self, page, pattern=None):
+        self.page = page
+        self.pattern = pattern
+
+    def _items(self):
+        if not self.page.ready():
+            return []
+        return [item for item in self.page.search_items if item.visible and (
+            self.pattern is None or self.pattern.fullmatch(item.title)
+        )]
+
+    async def all(self):
+        self.page.checks += 1
+        return self._items()
+
+    async def count(self):
+        return len(self._items())
+
+    def filter(self, *, has=None, has_text=None):
+        if has_text is not None:
+            return has_text
+        return FakeSearchResults(self.page, has)
+
+    def locator(self, selector):
+        items = self._items()
+        assert len(items) == 1
+        return items[0].locator(selector)
+
+    async def click(self):
+        items = self._items()
+        assert len(items) == 1
+        await items[0].click()
+
+
+class FakeSearchPage:
+    def __init__(self, items):
+        self.search = FakeSearchField()
+        self.search_items = items
+        self.checks = 0
+        self.ready = lambda: True
+        self.recent_requested = False
+
+    def locator(self, selector):
+        if selector.startswith("input"):
+            return self.search
+        if selector in (SEARCH_RESULT_SELECTOR + ":visible", SEARCH_RESULT_TITLE_SELECTOR):
+            return FakeSearchResults(self)
+        self.recent_requested = True
+        return FakeConversationList([])
+
+    def get_by_text(self, *_args, **_kwargs):
+        raise AssertionError("must never search arbitrary page text")
+
+
 class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_info_collector_maps_stable_id_to_current_aliases(self):
         class Response:
@@ -137,200 +242,55 @@ class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.items[0].clicked)
         self.assertTrue(page.items[1].clicked)
 
-    async def test_prefers_exact_global_search_result(self):
-        class SearchField:
-            def __init__(self): self.first = self; self.value = None
-            async def count(self): return 1
-            async def fill(self, value): self.value = value
-        class Result:
-            def __init__(self): self.first = self; self.clicked = False
-            async def count(self): return 1
-            async def click(self): self.clicked = True
-        class SearchPage:
-            def __init__(self): self.search = SearchField(); self.result = Result(); self.recent_requested = False
-            def locator(self, selector):
-                if selector.startswith("input"): return self.search
-                self.recent_requested = True
-                return FakeConversationList([])
-            def get_by_text(self, text, exact): return self.result
-        page = SearchPage()
-        selected = await select_web_chat_target(page, "ʚ繁花ɞ🌸")
-        self.assertEqual("ʚ繁花ɞ🌸", selected)
-        self.assertTrue(page.result.clicked)
+    async def test_prefers_complete_search_title(self):
+        item = FakeSearchItem("Target")
+        page = FakeSearchPage([FakeSearchItem("Target-Other"), item])
+        selected = await select_web_chat_target(page, "Target")
+        self.assertEqual("Target", selected)
+        self.assertTrue(item.clicked)
+        self.assertFalse(page.search_items[0].clicked)
         self.assertTrue(page.recent_requested)
 
     async def test_search_result_clicks_send_message_button(self):
-        class SearchField:
-            def __init__(self):
-                self.first = self
-
-            async def count(self):
-                return 1
-
-            async def fill(self, _value):
-                return None
-
-        class SendButton:
-            def __init__(self):
-                self.clicked = False
-
-            async def count(self):
-                return 1
-
-            async def is_visible(self):
-                return True
-
-            async def click(self):
-                self.clicked = True
-
-        class EmptyLocator:
-            async def count(self):
-                return 0
-
-        class AmbiguousLocator:
-            async def count(self):
-                return 2
-
-            async def is_visible(self):
-                raise RuntimeError("strict mode: parent and child both matched")
-
-        class Result(FakeConversation):
-            def __init__(self):
-                super().__init__("wzlovegsy")
-                self.send_button = SendButton()
-
-            def locator(self, selector):
-                if "//button" in selector:
-                    return EmptyLocator()
-                if "发消息" in selector:
-                    if "not(.//*" not in selector:
-                        return AmbiguousLocator()
-                    return self.send_button
-                return super().locator(selector)
-
-        class Results:
-            def __init__(self, item):
-                self.items = [item]
-                self.first = item
-
-            async def count(self):
-                return 1
-
-            async def all(self):
-                return self.items
-
-        class Page:
-            def __init__(self):
-                self.search = SearchField()
-                self.result = Result()
-
-            def locator(self, selector):
-                if selector == ".conversationConversationItemwrapper":
-                    return FakeConversationList([])
-                return self.search
-
-            def get_by_text(self, _text, exact):
-                return Results(self.result)
-
-        page = Page()
-
-        selected = await select_web_chat_target(page, "wzlovegsy")
-
-        self.assertEqual("wzlovegsy", selected)
-        self.assertTrue(page.result.send_button.clicked)
-        self.assertFalse(page.result.clicked)
+        item = FakeSearchItem("Target", send_button=True)
+        page = FakeSearchPage([item])
+        self.assertEqual("Target", await select_web_chat_target(page, "Target"))
+        self.assertTrue(item.send_button.clicked)
+        self.assertFalse(item.clicked)
 
     async def test_waits_for_delayed_search_result(self):
-        class SearchField:
-            def __init__(self):
-                self.first = self
-
-            async def count(self):
-                return 1
-
-            async def fill(self, _value):
-                return None
-
-        class DelayedResults:
-            def __init__(self):
-                self.item = FakeConversation("wzlovegsy")
-                self.first = self.item
-                self.checks = 0
-
-            async def count(self):
-                self.checks += 1
-                return 1 if self.checks >= 3 else 0
-
-            async def all(self):
-                return [self.item]
-
-        class Page:
-            def __init__(self):
-                self.search = SearchField()
-                self.results = DelayedResults()
-
-            def locator(self, selector):
-                if selector == ".conversationConversationItemwrapper":
-                    return FakeConversationList([])
-                return self.search
-
-            def get_by_text(self, _text, exact):
-                return self.results
-
-        page = Page()
-
-        selected = await select_web_chat_target(page, "wzlovegsy", timeout=1000)
-
-        self.assertEqual("wzlovegsy", selected)
-        self.assertGreaterEqual(page.results.checks, 3)
-        self.assertTrue(page.results.item.clicked)
+        item = FakeSearchItem("Target")
+        page = FakeSearchPage([item])
+        page.ready = lambda: page.checks >= 3
+        selected = await select_web_chat_target(page, "Target", timeout=1000)
+        self.assertEqual("Target", selected)
+        self.assertGreaterEqual(page.checks, 3)
+        self.assertTrue(item.clicked)
 
     async def test_retries_a_cold_search_panel_that_returns_nothing(self):
-        """页面加载后的第一次搜索常常不出结果；清空重搜一轮必须能挽回。"""
+        item = FakeSearchItem("Target")
+        page = FakeSearchPage([item])
+        page.ready = lambda: page.search.fills.count("Target") >= 2
+        selected = await select_web_chat_target(page, "Target", timeout=300)
+        self.assertEqual("Target", selected)
+        self.assertTrue(item.clicked)
+        self.assertEqual(["Target", "", "Target"], page.search.fills)
 
-        class SearchField:
-            def __init__(self):
-                self.first = self
-                self.fills = []
+    async def test_search_rejects_duplicate_complete_titles(self):
+        page = FakeSearchPage([FakeSearchItem("Target"), FakeSearchItem("Target")])
+        with self.assertRaises(AmbiguousTargetError):
+            await select_web_chat_target(page, "Target")
+        self.assertFalse(any(item.clicked for item in page.search_items))
 
-            async def count(self):
-                return 1
-
-            async def fill(self, value):
-                self.fills.append(value)
-
-        class Results:
-            def __init__(self, field):
-                self.field = field
-                self.item = FakeConversation("一一")
-
-            async def count(self):
-                # 只有「真的搜过 → 清空 → 再搜一次」之后，面板才给出结果
-                return 1 if self.field.fills.count("一一") >= 2 else 0
-
-            async def all(self):
-                return [self.item]
-
-        class Page:
-            def __init__(self):
-                self.search = SearchField()
-                self.results = Results(self.search)
-
-            def locator(self, selector):
-                if selector == ".conversationConversationItemwrapper":
-                    return FakeConversationList([])
-                return self.search
-
-            def get_by_text(self, _text, exact):
-                return self.results
-
-        page = Page()
-
-        selected = await select_web_chat_target(page, "一一", timeout=300)
-
-        self.assertEqual("一一", selected)
-        self.assertTrue(page.results.item.clicked)
-        self.assertEqual(["一一", "", "一一"], page.search.fills)
+    async def test_identifier_search_can_match_a_known_full_nickname(self):
+        item = FakeSearchItem("Current name")
+        page = FakeSearchPage([item])
+        selected = await select_web_chat_target(
+            page, "Old name", aliases=("stable-handle", "Current name")
+        )
+        self.assertEqual("Current name", selected)
+        self.assertEqual(["stable-handle"], page.search.fills)
+        self.assertTrue(item.clicked)
 
     async def test_ignores_hidden_duplicate_and_clicks_visible_conversation(self):
         page = FakeWebChatPage(
@@ -344,31 +304,13 @@ class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.items[0].clicked)
         self.assertTrue(page.items[1].clicked)
 
-    async def test_global_search_ignores_hidden_exact_result(self):
-        class SearchField:
-            def __init__(self): self.first = self
-            async def count(self): return 1
-            async def fill(self, _value): return None
-        class Results:
-            def __init__(self):
-                self.items = [FakeConversation("wzlovegsy", False), FakeConversation("wzlovegsy", True)]
-                self.first = self.items[0]
-            async def count(self): return len(self.items)
-            async def all(self): return self.items
-        class SearchPage:
-            def __init__(self): self.search = SearchField(); self.results = Results()
-            def locator(self, selector):
-                if selector == ".conversationConversationItemwrapper":
-                    return FakeConversationList([])
-                return self.search
-            def get_by_text(self, _text, exact): return self.results
-        page = SearchPage()
-
-        selected = await select_web_chat_target(page, "wzlovegsy")
-
-        self.assertEqual("wzlovegsy", selected)
-        self.assertFalse(page.results.items[0].clicked)
-        self.assertTrue(page.results.items[1].clicked)
+    async def test_search_ignores_hidden_exact_result(self):
+        hidden = FakeSearchItem("Target", visible=False)
+        visible = FakeSearchItem("Target")
+        page = FakeSearchPage([hidden, visible])
+        self.assertEqual("Target", await select_web_chat_target(page, "Target"))
+        self.assertFalse(hidden.clicked)
+        self.assertTrue(visible.clicked)
 
     async def test_clicks_already_visible_conversation_before_opening_search(self):
         class Page:
@@ -490,7 +432,7 @@ class WebChatNameNormalizationTests(unittest.IsolatedAsyncioTestCase):
             async def count(self):
                 return 1
 
-            async def inner_text(self):
+            async def inner_text(self, **_kwargs):
                 self.reads += 1
                 return "旧会话" if self.reads < 2 else "目标"
 
