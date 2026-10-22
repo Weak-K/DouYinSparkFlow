@@ -39,6 +39,7 @@ CONVERSATION_SCROLL_BUDGET_SECONDS = 20.0
 # （2026-09-24 线上实测：第一次 fill 等满 3 秒仍是 0 条，紧接着的第二次 0.5 秒就出。）
 SEARCH_COLD_START_RETRIES = 1
 SEARCH_COLD_START_SETTLE_SECONDS = 0.3
+SEARCH_CONTROL_APPEAR_TIMEOUT_MS = 3000
 
 logger = setup_logger(level=logging.DEBUG)
 
@@ -352,6 +353,35 @@ async def _search_in_panel(page, field, candidate, timeout_ms, *, candidates=())
     return []
 
 
+async def _wait_for_visible_search_field(page, timeout_ms):
+    """Wait briefly for chat hydration and return a visible, usable search input."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0, timeout_ms / 1000)
+    while True:
+        for selector in SEARCH_INPUT_SELECTORS:
+            search = page.locator(selector)
+            count = await search.count()
+            for index in range(count):
+                field = (
+                    search.nth(index)
+                    if count > 1 and hasattr(search, "nth")
+                    else search.first
+                )
+                if not hasattr(field, "fill"):
+                    continue
+                if hasattr(field, "is_visible") and not await field.is_visible():
+                    continue
+                if hasattr(field, "is_enabled") and not await field.is_enabled():
+                    continue
+                return field
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(0.1, remaining))
+
+
 async def opened_conversation_title(page) -> str:
     """读聊天区顶部「当前打开的会话」标题；读不到时返回空串。
 
@@ -456,32 +486,20 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
             logger.info("target_selection path=conversation status=clicked")
             return row.title
 
-    search_available = False
-    for selector in SEARCH_INPUT_SELECTORS:
-        try:
-            search = page.locator(selector)
-            if await search.count() == 0:
-                continue
-            field = search.first
-            if not hasattr(field, "fill"):
-                continue
-            if hasattr(field, "is_visible") and not await field.is_visible():
-                continue
-            search_available = True
-            for candidate in raw_candidates:
-                results = await _search_in_panel(
-                    page, field, candidate, timeout, candidates=raw_candidates
-                )
-                for result in results:
-                    if await _click_search_result(page, result, raw_candidates):
-                        return result.title
-            # 搜索结果会覆盖左栏，必须退出搜索再检查会话，不能在搜索态白等列表。
-            await field.fill("")
-            break
-        except (AttributeError, TypeError):
-            # Older page doubles and older layouts have no global search surface.
-            search_available = False
-            break
+    field = await _wait_for_visible_search_field(
+        page, min(timeout, SEARCH_CONTROL_APPEAR_TIMEOUT_MS)
+    )
+    search_available = field is not None
+    if field is not None:
+        for candidate in raw_candidates:
+            results = await _search_in_panel(
+                page, field, candidate, timeout, candidates=raw_candidates
+            )
+            for result in results:
+                if await _click_search_result(page, result, raw_candidates):
+                    return result.title
+        # 搜索结果会覆盖左栏，必须退出搜索再检查会话，不能在搜索态白等列表。
+        await field.fill("")
 
     await page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=timeout)
 

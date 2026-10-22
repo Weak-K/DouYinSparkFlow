@@ -89,6 +89,45 @@ class WebChatBrowserTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(1, len(results))
 
+    async def test_search_skips_hidden_duplicate_input_and_uses_visible_one(self):
+        await self.page.set_content('''
+          <input placeholder="搜索" style="display:none">
+          <input placeholder="搜索">
+          <div class="SearchPanelitembox">
+            <div class="SearchPanelitemtitle">Target</div>
+          </div>
+          <script>window.selected = false;</script>
+        ''')
+        await self.page.locator(chat.SEARCH_RESULT_SELECTOR).evaluate(
+            "el => el.onclick = () => { window.selected = true; }"
+        )
+
+        await chat.select_web_chat_target(self.page, "Target", timeout=2000)
+
+        self.assertTrue(await self.page.evaluate("window.selected"))
+
+    async def test_search_waits_for_chat_hydration_to_render_input(self):
+        await self.page.set_content('''
+          <div id="app"></div>
+          <script>
+            window.selected = false;
+            setTimeout(() => {
+              const input = document.createElement('input');
+              input.placeholder = '搜索';
+              input.addEventListener('input', () => {
+                document.querySelector('#app').innerHTML =
+                  '<div class="SearchPanelitembox" onclick="window.selected=true">' +
+                  '<div class="SearchPanelitemtitle">Target</div></div>';
+              });
+              document.querySelector('#app').append(input);
+            }, 250);
+          </script>
+        ''')
+
+        await chat.select_web_chat_target(self.page, "Target", timeout=2000)
+
+        self.assertTrue(await self.page.evaluate("window.selected"))
+
     async def test_total_search_budget_bounds_all_aliases(self):
         await self.page.set_content('<input placeholder="search">')
         with patch.object(chat, "SEARCH_INPUT_SELECTORS", ('input[placeholder="search"]',)):

@@ -375,8 +375,9 @@ class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
 
         from core.web_chat import TargetSearchUnavailableError
 
-        with self.assertRaises(TargetSearchUnavailableError):
-            await select_web_chat_target(page, "ʚ繁花ɞ🌸")
+        with patch("core.web_chat.SEARCH_CONTROL_APPEAR_TIMEOUT_MS", 1):
+            with self.assertRaises(TargetSearchUnavailableError):
+                await select_web_chat_target(page, "ʚ繁花ɞ🌸")
 
         self.assertFalse(page.items[0].clicked)
 
