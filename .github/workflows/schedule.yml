@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "0 1 * * *" # 09:00 Asia/Shanghai
 
+concurrency:
+  group: spark-schedule-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   run-main:
     timeout-minutes: 20
