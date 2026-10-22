@@ -128,6 +128,27 @@ class WebChatBrowserTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await self.page.evaluate("window.selected"))
 
+    async def test_search_waits_more_than_three_seconds_for_input(self):
+        await self.page.set_content('''
+          <div id="app"></div>
+          <script>
+            window.selected = false;
+            setTimeout(() => {
+              document.querySelector('#app').innerHTML =
+                '<div class="conversationConversationItemwrapper">' +
+                '<span class="conversationConversationItemtitle">Other</span></div>' +
+                '<input placeholder="搜索">' +
+                '<div class="SearchPanelitembox" onclick="window.selected=true">' +
+                '<div class="SearchPanelitemtitle">Target</div></div>';
+            }, 3200);
+          </script>
+        ''')
+
+        await chat.select_web_chat_target(self.page, "Target", timeout=8000)
+
+        self.assertEqual(1, await self.page.locator('input[placeholder="搜索"]').count())
+        self.assertTrue(await self.page.evaluate("window.selected"))
+
     async def test_search_does_not_start_before_conversation_hydration(self):
         await self.page.set_content('''
           <div id="app"></div>
