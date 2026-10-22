@@ -128,6 +128,26 @@ class WebChatBrowserTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await self.page.evaluate("window.selected"))
 
+    async def test_search_does_not_start_before_conversation_hydration(self):
+        await self.page.set_content('''
+          <div id="app"></div>
+          <script>
+            window.selected = false;
+            setTimeout(() => {
+              document.querySelector('#app').innerHTML =
+                '<div class="conversationConversationItemwrapper">' +
+                '<span class="conversationConversationItemtitle">Other</span></div>' +
+                '<input placeholder="搜索">';
+            }, 250);
+          </script>
+        ''')
+
+        with patch.object(chat, "_search_in_panel", return_value=[]):
+            with self.assertRaises(chat.TargetNotFoundError):
+                await chat.select_web_chat_target(self.page, "Absent", timeout=2000)
+
+        self.assertEqual(1, await self.page.locator(chat.CONVERSATION_ITEM_SELECTOR).count())
+
     async def test_total_search_budget_bounds_all_aliases(self):
         await self.page.set_content('<input placeholder="search">')
         with patch.object(chat, "SEARCH_INPUT_SELECTORS", ('input[placeholder="search"]',)):

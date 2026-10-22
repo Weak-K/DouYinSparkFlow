@@ -34,6 +34,7 @@ _INVISIBLE_CHARACTERS = dict.fromkeys(
 CONVERSATION_SCROLL_MAX_ITEMS = 300
 # 滚动刷新好友快照的硬预算：宁可少读几个，也不能把任务的 180 秒执行超时顶掉。
 CONVERSATION_SCROLL_BUDGET_SECONDS = 20.0
+CONVERSATION_HYDRATION_TIMEOUT_MS = 10000
 
 # 搜索面板冷启动：同一个页面上的第一次输入常常不出结果，清空重搜一轮即可恢复。
 # （2026-09-24 线上实测：第一次 fill 等满 3 秒仍是 0 条，紧接着的第二次 0.5 秒就出。）
@@ -382,6 +383,22 @@ async def _wait_for_visible_search_field(page, timeout_ms):
         await asyncio.sleep(min(0.1, remaining))
 
 
+async def _wait_for_conversation_rows(page, timeout_ms) -> bool:
+    """Poll the virtual list without leaving a cancelled Playwright wait behind."""
+
+    if await page.locator(CONVERSATION_LIST_SELECTOR).count() == 0:
+        return False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0, timeout_ms / 1000)
+    while True:
+        if await page.locator(CONVERSATION_ITEM_SELECTOR).count() > 0:
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.1, remaining))
+
+
 async def opened_conversation_title(page) -> str:
     """读聊天区顶部「当前打开的会话」标题；读不到时返回空串。
 
@@ -480,6 +497,11 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
             await page.wait_for_timeout(150)
 
     rows = await _conversation_rows(page, scroll=False)
+    # 首次进入聊天页时左栏和搜索输入会分别 hydration。只有首屏确实为空时，
+    # 才给生产执行一个短等待；已读到会话则立即选人，避免额外触碰搜索面板。
+    if not rows and timeout >= CONVERSATION_HYDRATION_TIMEOUT_MS:
+        await _wait_for_conversation_rows(page, CONVERSATION_HYDRATION_TIMEOUT_MS)
+        rows = await _conversation_rows(page, scroll=False)
     remember(rows)
     for row in rows:
         if row.title in raw_candidates and await _click_conversation_row(page, row):
@@ -501,7 +523,7 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
         # 搜索结果会覆盖左栏，必须退出搜索再检查会话，不能在搜索态白等列表。
         await field.fill("")
 
-    await page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=timeout)
+    await _wait_for_conversation_rows(page, timeout)
 
     rows = await _conversation_rows(page, scroll=False)
     remember(rows)
