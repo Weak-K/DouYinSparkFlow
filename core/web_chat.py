@@ -142,7 +142,11 @@ def _optional_string(value) -> str | None:
 
 
 class TargetNotFoundError(RuntimeError):
-    """Raised when the requested friend is absent from the web chat list."""
+    """Raised when the requested friend is absent from conversations and exact search."""
+
+
+class TargetSearchUnavailableError(RuntimeError):
+    """Raised when no usable search control was found to verify a missing target."""
 
 
 class AmbiguousTargetError(RuntimeError):
@@ -452,12 +456,18 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
             logger.info("target_selection path=conversation status=clicked")
             return row.title
 
+    search_available = False
     for selector in SEARCH_INPUT_SELECTORS:
         try:
             search = page.locator(selector)
             if await search.count() == 0:
                 continue
             field = search.first
+            if not hasattr(field, "fill"):
+                continue
+            if hasattr(field, "is_visible") and not await field.is_visible():
+                continue
+            search_available = True
             for candidate in raw_candidates:
                 results = await _search_in_panel(
                     page, field, candidate, timeout, candidates=raw_candidates
@@ -470,6 +480,7 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
             break
         except (AttributeError, TypeError):
             # Older page doubles and older layouts have no global search surface.
+            search_available = False
             break
 
     await page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=timeout)
@@ -491,6 +502,10 @@ async def _select_web_chat_target(page, target, timeout, aliases, scroll, discov
         ):
             logger.info("target_selection path=conversation_normalized status=clicked")
             return row.title
+
+    if not search_available:
+        logger.warning("target_selection path=search status=unavailable")
+        raise TargetSearchUnavailableError("search_control_unavailable")
 
     raise TargetNotFoundError(f"未在抖音聊天列表中找到好友 {normalized_target}")
 

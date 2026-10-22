@@ -556,10 +556,13 @@ class _FakePlaywrightManager:
 
 
 class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
-    async def _execute_until_target_selection(self, raw, version, browser=None):
+    async def _execute_until_target_selection(
+        self, raw, version, browser=None, selection_error=None
+    ):
         from core.web_chat import TargetNotFoundError
 
         browser = browser or _FakeBrowser()
+        selection_error = selection_error or TargetNotFoundError("fixed public mapping")
         async_api = ModuleType("playwright.async_api")
         async_api.async_playwright = lambda: _FakePlaywrightManager(browser)
         playwright = ModuleType("playwright")
@@ -572,7 +575,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         core_tasks.confirm_message_sent = confirm_message_sent
 
         async def target_not_found(*_args, **_kwargs):
-            raise TargetNotFoundError("fixed public mapping")
+            raise selection_error
 
         with patch.dict(
             "sys.modules",
@@ -595,6 +598,19 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, len(browser.context_options))
         self.assertEqual(1, len(browser.context.cookies_added))
         self.assertEqual("target_not_found", result.error_code)
+        self.assertIn("昵称/抖音号", result.error_summary)
+        self.assertTrue(result.retryable)
+
+    async def test_executor_maps_unavailable_search_control_to_its_own_retryable_error(self):
+        from core.web_chat import TargetSearchUnavailableError
+
+        raw = b'[{"name":"sid","value":"search-unavailable-marker","domain":".douyin.com","path":"/"}]'
+        _, result = await self._execute_until_target_selection(
+            raw, 1, selection_error=TargetSearchUnavailableError("no search control")
+        )
+
+        self.assertEqual("target_search_unavailable", result.error_code)
+        self.assertIn("搜索控件不可用", result.error_summary)
         self.assertTrue(result.retryable)
 
     async def test_executor_creates_version_two_context_without_adding_cookies(self):

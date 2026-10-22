@@ -46,9 +46,6 @@ STATE_FILENAME = "alert-state.json"
 SUPPORTED_SECURITY = {"ssl", "starttls", "plain"}
 CONSOLE_URL = "https://lgnsl.com/spark/"
 
-# 这些错误码通常意味着账号未登录 / Cookie 失效，任务主人邮件里给出对应提示
-COOKIE_RELATED_CODES = {"cookie_invalid", "conversation_not_opened", "target_not_found"}
-
 # 已由「按用户」的失效提醒覆盖，全局告警不再重复发
 USER_SCOPED_CODES = {"cookie_invalid"}
 
@@ -259,11 +256,18 @@ def _build_failure_body(
             lines.append(f"目标：{context.target_name}")
     if task_id:
         lines.append(f"任务：{task_id}")
-    if error_code in COOKIE_RELATED_CODES:
+    if error_code == "target_search_unavailable":
         lines += [
             "",
-            "这通常意味着该账号未登录或 Cookie 已失效。",
-            "请登录控制台，在「抖音账号」页面重新扫码绑定。",
+            "自动化未能找到可用的抖音聊天搜索框，因此没有完成目标搜索。",
+            "请确认账号已进入抖音聊天页；若页面可正常搜索但任务仍失败，请提供任务 ID 和失败时间排查页面结构。",
+        ]
+    elif error_code == "target_not_found":
+        lines += [
+            "",
+            "自动化未能在会话列表或抖音搜索中找到该目标。",
+            "请先在当前抖音账号的聊天搜索中确认任务填写的昵称或抖音号能显示该用户的完整标题。",
+            "若搜索不到，请核对目标名称是否变更，并确认对方的搜索与私信权限；若手动能搜到但任务仍失败，请提供任务 ID 和失败时间排查页面结构。",
         ]
     if suppressed:
         lines += ["", f"（本次冷却窗口内另有 {suppressed} 条同类失败告警已被抑制）"]

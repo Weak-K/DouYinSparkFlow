@@ -9,6 +9,7 @@ from core.web_chat import (
     WEB_CHAT_URL,
     AmbiguousTargetError,
     TargetNotFoundError,
+    TargetSearchUnavailableError,
     UserInfoCollector,
     matches_opened_conversation,
     select_web_chat_target,
@@ -172,7 +173,16 @@ class DouyinExecutor:
                 False,
                 ExecutionStage.SELECTING_TARGET,
                 "target_not_found",
-                "未找到完全匹配的目标好友",
+                "会话列表和精确搜索均未找到目标，请检查昵称/抖音号及对方搜索、私信权限",
+                retryable=True,
+                discovered_names=tuple(discovered),
+            )
+        except TargetSearchUnavailableError:
+            return ExecutionResult(
+                False,
+                ExecutionStage.SELECTING_TARGET,
+                "target_search_unavailable",
+                "未找到会话中的目标，且抖音聊天搜索控件不可用，尚未完成目标搜索",
                 retryable=True,
                 discovered_names=tuple(discovered),
             )

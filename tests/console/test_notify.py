@@ -296,6 +296,40 @@ class TaskFailureAlertTests(unittest.TestCase):
         self.assertIn("conversation_not_opened", body)
         self.assertIn("6fb1ff75-be90-4000-a054-5745a1204b03", body)
 
+    def test_target_not_found_suggests_search_and_privacy_checks_not_cookie_reset(self):
+        with patch("spark_console.notify._send_async") as dispatcher:
+            sent = self.alert(
+                stage="selecting_target",
+                error_code="target_not_found",
+                error_summary="会话列表和精确搜索均未找到目标",
+                task_id="run-target-lookup",
+                settings=self.settings,
+            )
+
+        self.assertTrue(sent)
+        body = dispatcher.call_args.args[3]
+        self.assertIn("昵称或抖音号", body)
+        self.assertIn("搜索与私信权限", body)
+        self.assertIn("run-target-lookup", body)
+        self.assertNotIn("重新扫码", body)
+        self.assertNotIn("Cookie 已失效", body)
+
+    def test_unavailable_search_control_is_reported_as_page_issue(self):
+        with patch("spark_console.notify._send_async") as dispatcher:
+            sent = self.alert(
+                stage="selecting_target",
+                error_code="target_search_unavailable",
+                error_summary="抖音聊天搜索控件不可用",
+                task_id="run-search-control",
+                settings=self.settings,
+            )
+
+        self.assertTrue(sent)
+        body = dispatcher.call_args.args[3]
+        self.assertIn("没有完成目标搜索", body)
+        self.assertIn("run-search-control", body)
+        self.assertNotIn("重新扫码", body)
+
     def test_other_failures_notify_only_the_task_owner(self):
         with patch("spark_console.notify._send_async") as dispatcher:
             sent = self.alert(

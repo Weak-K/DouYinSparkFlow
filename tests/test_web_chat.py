@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from core.web_chat import (
     CONVERSATION_LIST_SELECTOR,
@@ -75,7 +76,14 @@ class FakeWebChatPage:
         self.waited_for = (selector, timeout)
 
     def locator(self, selector):
+        if selector.startswith("input"):
+            return FakeSearchUnavailable()
         return FakeConversationList(self.items)
+
+
+class FakeSearchUnavailable:
+    async def count(self):
+        return 0
 
 
 class FakeSearchField:
@@ -167,6 +175,9 @@ class FakeSearchPage:
         self.checks = 0
         self.ready = lambda: True
         self.recent_requested = False
+
+    async def wait_for_selector(self, _selector, *, timeout):
+        return None
 
     def locator(self, selector):
         if selector.startswith("input"):
@@ -362,10 +373,21 @@ class WebChatSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_fails_instead_of_sending_to_the_wrong_conversation(self):
         page = FakeWebChatPage(["another friend"])
 
-        with self.assertRaises(TargetNotFoundError):
+        from core.web_chat import TargetSearchUnavailableError
+
+        with self.assertRaises(TargetSearchUnavailableError):
             await select_web_chat_target(page, "ʚ繁花ɞ🌸")
 
         self.assertFalse(page.items[0].clicked)
+
+    async def test_reports_target_missing_only_after_search_control_was_available(self):
+        page = FakeSearchPage([])
+
+        with patch("core.web_chat._search_in_panel", return_value=[]):
+            with self.assertRaises(TargetNotFoundError):
+                await select_web_chat_target(page, "Target")
+
+        self.assertEqual([""], page.search.fills)
 
 
 class FakeScrollContainer:
@@ -468,10 +490,11 @@ class WebChatNameNormalizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.items[1].clicked)
 
     async def test_never_matches_a_differently_cased_name(self):
-        page = FakeWebChatPage(["alp"])
+        page = FakeSearchPage([FakeSearchItem("alp")])
 
-        with self.assertRaises(TargetNotFoundError):
-            await select_web_chat_target(page, "Alp")
+        with patch("core.web_chat._search_in_panel", return_value=[]):
+            with self.assertRaises(TargetNotFoundError):
+                await select_web_chat_target(page, "Alp")
 
     async def test_normalization_only_folds_invisible_differences(self):
         self.assertEqual("Alp", normalize_target_name("  Alp\u200b "))
