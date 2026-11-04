@@ -75,7 +75,7 @@ class DouyinExecutor:
         target_aliases: tuple[str, ...] = (),
     ) -> ExecutionResult:
         from playwright.async_api import async_playwright
-        from core.tasks import confirm_message_sent
+        from core.tasks import confirm_message_sent, read_message_baseline
 
         stage = ExecutionStage.AUTHENTICATING
         # 发送边界标记。Enter 按下之前为 False，之后为 True；只有 False 时
@@ -174,14 +174,24 @@ class DouyinExecutor:
                         )
                     # 不可逆点：Enter 一经按下，页面可能已经在发送，即便随后
                     # 报错也无法证明没发出去。先置位，再触发。
+                    # 发送前记录气泡基线，发送后才能区分「新消息」和历史的同模板消息。
+                    baseline = await read_message_baseline(page)
                     send_attempted = True
                     await editor.press("Enter")
                     stage = ExecutionStage.CONFIRMING
                     if refresh_targets:
                         identities = await user_info.drain()
                     try:
-                        await confirm_message_sent(page, editor, message, timeout=20000)
-                    except Exception:
+                        await confirm_message_sent(
+                            page, editor, message, timeout=45000, baseline=baseline
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            "delivery_confirmation_failed error=%s detail=%s baseline=%s",
+                            type(error).__name__,
+                            str(error)[:100],
+                            "none" if baseline is None else "set",
+                        )
                         return ExecutionResult(
                             True,
                             ExecutionStage.SUBMITTED,

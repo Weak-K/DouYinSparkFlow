@@ -10,6 +10,12 @@ from spark_console.credentials import CredentialError, CredentialPayload
 from spark_console.executor import DeliveryState, DouyinExecutor
 
 
+async def _baseline_unavailable(*_args, **_kwargs):
+    """执行器用例不依赖真实页面，气泡基线一律读不到。"""
+
+    return None
+
+
 _PLAYWRIGHT_INVALID_LEGACY_LOCATIONS = {
     "domain_leading_combining_idna": {
         "domain": "\u0301a.com",
@@ -572,6 +578,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = async_api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
 
         async def confirm_message_sent(*_args, **_kwargs):
             return None
@@ -666,6 +673,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = async_api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
 
         async def confirmation_timeout(*_args, **_kwargs):
             raise TimeoutError("message bubble was not observable")
@@ -715,6 +723,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = async_api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
         core_tasks.confirm_message_sent = lambda *_args, **_kwargs: None
 
         async def select_target(*_args, **_kwargs):
@@ -762,6 +771,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = async_api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
         core_tasks.confirm_message_sent = lambda *_args, **_kwargs: None
 
         async def select_target(*_args, **_kwargs):
@@ -798,6 +808,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = async_api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
         core_tasks.confirm_message_sent = lambda *_args, **_kwargs: None
 
         async def select_target(*_args, **_kwargs):
@@ -835,6 +846,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = async_api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
         core_tasks.confirm_message_sent = lambda *_args, **_kwargs: None
 
         async def select_target(*_args, **_kwargs):
@@ -891,6 +903,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
         core_tasks.confirm_message_sent = AsyncMock()
         raw = b'[{"name":"sid","value":"guard-test","domain":".douyin.com","path":"/"}]'
         with patch.dict("sys.modules", {
@@ -919,6 +932,7 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         playwright = ModuleType("playwright")
         playwright.async_api = async_api
         core_tasks = ModuleType("core.tasks")
+        core_tasks.read_message_baseline = _baseline_unavailable
 
         async def confirm_message_sent(*_args, **_kwargs):
             return None

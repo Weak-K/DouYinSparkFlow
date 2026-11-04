@@ -24,6 +24,22 @@ Enter 之前还有一道闸：输入完成后会读一次编辑器内容，**明
 
 Worker 会在日志里输出 `task_run delivery_state=... stage=... success=...`。`success=true` 且 `delivery_state=uncertain` 的组合表示「按已提交计成功，但没有送达证据」，排查重复消息时应优先看这一行。
 
+### 二次确认（2026-11-05）
+
+旧实现先等待输入框清空，再按模板原文在页面查找消息。线上实测这两步都不可靠：
+
+- 模板里的 `[盖瑞]`、`[加一]` 会被抖音渲染成表情图片，聊天区只剩「今日火花」，按原文匹配永远找不到。
+- 按 Enter 后抖音会重建输入框节点，发送前拿到的 element handle 读不到清空，等待必然超时。
+
+新实现（[`core/tasks.py`](../core/tasks.py)）：
+
+1. Enter 之前记录当前**全部**消息气泡（`.messageMessageBoxmessageBox`）的文本作为基线。
+2. Enter 后每 0.5 秒重新读取气泡文本，最多等 45 秒。
+3. 出现任意一条「基线里没有、且包含去掉方括号表情标签后可见文字」的气泡即判定 `confirmed`（`stage=complete`、`error_code=NULL`）。
+4. 45 秒内没有出现则记 `delivery_confirmation_unavailable` / `uncertain`：按已提交计成功，**不自动重试、不发失败邮件**。
+
+只有 `confirmed` 才代表页面已看到本条消息；`uncertain` 仍只是「可能已送达」。排查时以 `task_runs.stage` 为准，`complete` 是确认成功。
+
 ### 同时到期任务与排队
 
 - 在线 Worker 每次查询会登记所有按时到期的任务，再串行执行；有积压时立即领取下一条，空队列才等待 10 秒。
@@ -169,6 +185,31 @@ docker compose -f compose.console.yml ps
 不要在日志中输出 Cookie、密码、环境变量或聊天正文。只报告任务 ID、阶段、成功/失败及脱敏错误码。
 
 ## Cookie 失效提醒邮件
+
+### 线上配置状态（2026-11-05）
+
+当前 103 服务器已配置 SMTP，发件邮箱为 `zhujinxi_test@163.com`（smtp.163.com:465，SSL），告警收件人取自各任务所属用户的 `users.email`；`SPARK_ALERT_EMAIL_TO` 仅用于兼容配置和独立连通性测试。实测 `send_mail` 返回 `True`。
+
+**授权码只保存在服务器 `/opt/douyin-spark-console/.env.console`（权限 600），不得写入仓库、文档、聊天或日志。** 修改后只需重建 Worker 容器，不需要重建镜像：
+
+```bash
+docker compose --env-file .env.console -f compose.console.yml up -d --force-recreate spark-worker
+```
+
+连通性测试在现有 Worker 容器内执行（会把测试信发给 `SPARK_ALERT_EMAIL_TO`）：
+
+```bash
+docker exec douyin-spark-console-spark-worker-1 python -c \
+  "import os; from spark_console.notify import MailSettings, send_mail; s = MailSettings.from_environ(os.environ); print('configured:', s.configured, 'recipients:', len(s.alert_recipients)); print('sent:', send_mail(s, s.alert_recipients, '【火花控制台】邮件通道测试', '连通性测试'))"
+```
+
+### 失败邮件触发规则
+
+| 场景 | `task_runs` 结果 | 是否重试 | 是否发邮件 |
+| --- | --- | --- | --- |
+| Enter 之前失败（找不到人、目标歧义、会话未打开、Cookie 失效等） | `failed` + 具体错误码 | 按既有策略 | 是（任务主人，60 分钟冷却；`cookie_invalid` 单独发重新登录提醒） |
+| Enter 后 45 秒内没看到新气泡 | `success` / `submitted`，`uncertain` | 否 | 否 |
+| 看到新气泡 | `success` / `complete` | 不需要 | 否 |
 
 每个控制台账号在注册时必须填写**自己的通知邮箱**（`users.email`）。账号下绑定的抖音号各不相同，所以提醒邮件只发给该抖音号所属的用户本人，不存在全局群发。
 

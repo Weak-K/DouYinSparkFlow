@@ -6,6 +6,7 @@ logs/
 .DS_Store
 usersData.json
 .env.console
+.env.console.local
 secrets/
 data/
 backups/

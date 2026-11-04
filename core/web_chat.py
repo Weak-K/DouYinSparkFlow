@@ -562,7 +562,7 @@ async def run_wz_web_chat_probe():
     """Send and verify one WZ message through https://www.douyin.com/chat."""
     from core.browser import get_browser
     from core.msg_builder import build_message
-    from core.tasks import confirm_message_sent
+    from core.tasks import confirm_message_sent, read_message_baseline
     from utils.config import get_userData
 
     users = get_userData()
@@ -610,8 +610,9 @@ async def run_wz_web_chat_probe():
                 await chat_input.press("Shift+Enter")
 
         logger.info(f"账号 {username} 准备通过抖音网页聊天发送消息给 {target}")
+        baseline = await read_message_baseline(page)
         await chat_input.press("Enter")
-        await confirm_message_sent(page, chat_input, message)
+        await confirm_message_sent(page, chat_input, message, baseline=baseline)
         logger.info(f"账号 {username} 给好友 {target} 发送消息并确认送达完成")
     finally:
         if context is not None:

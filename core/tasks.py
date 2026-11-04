@@ -2,6 +2,7 @@ import asyncio
 import traceback
 import logging
 import os
+import re
 from datetime import datetime
 from utils.logger import setup_logger
 from utils.config import get_config, get_userData
@@ -80,21 +81,79 @@ async def click_first_match(page, selector):
     await page.locator(selector).first.click()
 
 
-async def confirm_message_sent(page, chat_input, message, timeout=15000):
+MESSAGE_BUBBLE_SELECTOR = ".messageMessageBoxmessageBox"
+
+MESSAGE_BUBBLE_TEXTS_SCRIPT = """(selector) => {
+    return Array.from(document.querySelectorAll(selector))
+        .map(node => (node.innerText || '').trim())
+        .filter(text => text);
+}"""
+
+
+def visible_message_fragments(message):
+    """提取消息在聊天区真正可见的文字。
+
+    抖音会把 ``[盖瑞]``、``[加一]`` 之类的表情标签渲染成图片，页面文本只剩
+    “今日火花”，所以确认不能按模板原文匹配。去掉方括号标签后剩余的每一行
+    都是可用的可见片段；纯表情消息返回空元组。
+    """
+
+    without_emoji = re.sub(r"\[[^\[\]]*\]", "", message)
+    return tuple(
+        line.strip() for line in without_emoji.splitlines() if line.strip()
+    )
+
+
+async def read_message_baseline(page):
+    """读取发送前所有消息气泡的文本，供发送后识别新出现的消息。
+
+    抖音的消息列表会复用/重排 DOM 节点，只记最后一条并不可靠；这里记下
+    发送前已有的全部气泡文本，发送后只要出现一条「基线里没有、且包含
+    消息可见片段」的气泡，就能确认本次消息已经渲染。
+    """
+
+    try:
+        result = await page.evaluate(
+            MESSAGE_BUBBLE_TEXTS_SCRIPT, MESSAGE_BUBBLE_SELECTOR
+        )
+    except Exception:
+        return None
+    if not isinstance(result, list):
+        return None
+    return tuple(str(text) for text in result)
+
+
+async def confirm_message_sent(page, chat_input, message, timeout=15000, baseline=None):
     """Wait until the editor clears and the sent message appears in the chat."""
     verification_lines = [line.strip() for line in message.splitlines() if line.strip()]
-    if not verification_lines:
+    fragments = visible_message_fragments(message)
+    if not verification_lines or not fragments:
         raise ValueError("message must contain visible text")
 
     input_handle = await chat_input.element_handle()
     if input_handle is None:
         raise RuntimeError("chat input is no longer attached")
 
-    await page.wait_for_function(
-        "(element) => !element.innerText.trim()",
-        arg=input_handle,
-        timeout=timeout,
-    )
+    if baseline is not None:
+        before = set(baseline)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout / 1000
+        while True:
+            try:
+                texts = await page.evaluate(
+                    MESSAGE_BUBBLE_TEXTS_SCRIPT, MESSAGE_BUBBLE_SELECTOR
+                )
+            except Exception:
+                texts = []
+            if isinstance(texts, list) and any(
+                text not in before and any(fragment in text for fragment in fragments)
+                for text in texts
+            ):
+                return
+            if loop.time() >= deadline:
+                raise TimeoutError("sent message did not appear in chat")
+            await asyncio.sleep(0.5)
+
     await page.get_by_text(verification_lines[-1], exact=False).last.wait_for(
         state="visible",
         timeout=timeout,

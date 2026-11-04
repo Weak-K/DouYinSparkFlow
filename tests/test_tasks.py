@@ -5,6 +5,8 @@ from core.tasks import (
     click_first_match,
     confirm_message_sent,
     page_has_login_prompt,
+    read_message_baseline,
+    visible_message_fragments,
     wait_for_authenticated_selector,
     wait_for_first_visible,
 )
@@ -80,10 +82,14 @@ class FakeChatInput:
 
 
 class FakeDeliveryPage:
-    def __init__(self):
+    def __init__(self, bubble_states=None):
         self.wait_function_calls = []
         self.message_locator = FakeMessageLocator()
         self.requested_text = None
+        self.evaluated = []
+        self.bubble_states = list(
+            bubble_states or [["old message", "oldest message"]]
+        )
 
     async def wait_for_function(self, expression, *, arg, timeout):
         self.wait_function_calls.append((expression, arg, timeout))
@@ -91,6 +97,12 @@ class FakeDeliveryPage:
     def get_by_text(self, text, *, exact):
         self.requested_text = (text, exact)
         return self.message_locator
+
+    async def evaluate(self, expression, arg):
+        self.evaluated.append((expression, arg))
+        if len(self.bubble_states) > 1:
+            return self.bubble_states.pop(0)
+        return self.bubble_states[0]
 
 
 class WaitForFirstVisibleTests(unittest.IsolatedAsyncioTestCase):
@@ -145,8 +157,42 @@ class ClickFirstMatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await page_has_login_prompt(page))
 
 
+class VisibleMessageFragmentsTests(unittest.TestCase):
+    def test_strips_douyin_emoji_tags(self):
+        self.assertEqual(
+            ("今日火花",), visible_message_fragments("[盖瑞]今日火花[加一]")
+        )
+
+    def test_keeps_each_visible_line(self):
+        self.assertEqual(
+            ("第一行", "第二行"),
+            visible_message_fragments("第一行\n[笑脸]第二行"),
+        )
+
+
+class MessageBaselineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reads_both_ends_of_the_bubble_list(self):
+        page = FakeDeliveryPage()
+
+        self.assertEqual(
+            ("old message", "oldest message"),
+            await read_message_baseline(page),
+        )
+        self.assertEqual(1, len(page.evaluated))
+        self.assertEqual(
+            ".messageMessageBoxmessageBox", page.evaluated[0][1]
+        )
+
+    async def test_returns_none_when_the_page_cannot_be_read(self):
+        class UnreadablePage:
+            async def evaluate(self, *_args):
+                raise RuntimeError("page closed")
+
+        self.assertIsNone(await read_message_baseline(UnreadablePage()))
+
+
 class ConfirmMessageSentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_waits_for_input_clear_and_last_message_line_to_appear(self):
+    async def test_falls_back_to_last_message_line_without_baseline(self):
         page = FakeDeliveryPage()
         chat_input = FakeChatInput()
 
@@ -157,12 +203,60 @@ class ConfirmMessageSentTests(unittest.IsolatedAsyncioTestCase):
             timeout=1200,
         )
 
-        self.assertEqual(
-            [("(element) => !element.innerText.trim()", "chat-input-handle", 1200)],
-            page.wait_function_calls,
-        )
+        self.assertEqual([], page.wait_function_calls)
         self.assertEqual(("unique verification line", False), page.requested_text)
         self.assertEqual([("visible", 1200)], page.message_locator.wait_calls)
+
+    async def test_waits_for_a_new_bubble_with_visible_text_when_baseline_is_known(self):
+        page = FakeDeliveryPage(
+            bubble_states=[["刚刚\n今日火花", "oldest message"]]
+        )
+        chat_input = FakeChatInput()
+
+        await confirm_message_sent(
+            page,
+            chat_input,
+            "[盖瑞]今日火花[加一]",
+            timeout=1200,
+            baseline=("old message", "oldest message"),
+        )
+
+        self.assertEqual([], page.wait_function_calls)
+        self.assertEqual(1, len(page.evaluated))
+        self.assertEqual(".messageMessageBoxmessageBox", page.evaluated[0][1])
+        self.assertIsNone(page.requested_text)
+
+    async def test_keeps_polling_until_a_new_bubble_appears(self):
+        page = FakeDeliveryPage(
+            bubble_states=[
+                ["old message", "oldest message"],
+                ["刚刚\n今日火花", "oldest message"],
+            ]
+        )
+        chat_input = FakeChatInput()
+
+        await confirm_message_sent(
+            page,
+            chat_input,
+            "[盖瑞]今日火花[加一]",
+            timeout=1200,
+            baseline=("old message", "oldest message"),
+        )
+
+        self.assertEqual(2, len(page.evaluated))
+
+    async def test_times_out_when_the_sent_message_never_appears(self):
+        page = FakeDeliveryPage()
+        chat_input = FakeChatInput()
+
+        with self.assertRaises(TimeoutError):
+            await confirm_message_sent(
+                page,
+                chat_input,
+                "[盖瑞]今日火花[加一]",
+                timeout=600,
+                baseline=("old message", "oldest message"),
+            )
 
 
 if __name__ == "__main__":
