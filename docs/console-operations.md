@@ -18,6 +18,8 @@ Worker 只有一个实例、并发为 1；发送前可恢复失败最多自动�
 
 边界是 **Enter 按下那一刻**。此后的一切异常——按键报错、页面崩溃、确认超时——都不足以证明消息没发出去，一律记为 `uncertain` 并禁止自动重试。
 
+Enter 之前还有一道闸：输入完成后会读一次编辑器内容，**明确读到空**则记 `message_not_entered` 并中止，绝不按 Enter。空按要么发出空消息、要么毫无反应，两种都不该被记成「可能已送达」。读不到内容时保持原行为，不误拦。该状态属于 `not_sent`，可按原策略重试。
+
 `retryable` 与 `safe_to_retry` 是两个不同的问题：前者是业务策略（`target_ambiguous` 技术上没发，但重试仍是歧义，故不重试），后者是技术安全性。改动发送逻辑时不要用其中一个去推导另一个。
 
 Worker 会在日志里输出 `task_run delivery_state=... stage=... success=...`。`success=true` 且 `delivery_state=uncertain` 的组合表示「按已提交计成功，但没有送达证据」，排查重复消息时应优先看这一行。
