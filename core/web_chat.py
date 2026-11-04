@@ -14,7 +14,15 @@ WEB_CHAT_URL = "https://www.douyin.com/chat"
 CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
 CONVERSATION_LIST_SELECTOR = ".conversationConversationListwrapper"
-CHAT_EDITOR_SELECTOR = ".messageEditorimChatEditorContainer"
+# 输入区：优先直接定位 Draft.js 的可编辑本体，容器作为兜底。
+# 只给容器时，输入要依赖 Playwright 在容器内部自行寻找可编辑元素，
+# 页面结构一变就可能出现"看起来输入了、其实没进去"。
+CHAT_EDITOR_SELECTORS = (
+    '[data-e2e="msg-input"] .public-DraftEditor-content',
+    '.DraftEditor-root [contenteditable="true"]',
+    ".messageEditorimChatEditorContainer",
+)
+CHAT_EDITOR_SELECTOR = ", ".join(CHAT_EDITOR_SELECTORS)
 # 聊天区顶部「当前打开的会话」标题（发送前校验的依据）
 CONVERSATION_HEADER_SELECTOR = ".RightPanelHeadertitle"
 SEARCH_INPUT_SELECTORS = (

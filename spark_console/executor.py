@@ -153,6 +153,25 @@ class DouyinExecutor:
                         await editor.type(line)
                         if index < len(lines) - 1:
                             await editor.press("Shift+Enter")
+                    # 输入完成后再确认编辑器确实拿到了内容。读不到就不拦（保持
+                    # 原行为），只有明确读到空才中止：空按 Enter 只会发出空消息
+                    # 或毫无反应，这两种都不应记成「可能已送达」。
+                    read_ok = True
+                    try:
+                        typed = (await editor.inner_text()).strip()
+                    except Exception:
+                        read_ok = False
+                        typed = ""
+                    if read_ok and not typed:
+                        return ExecutionResult(
+                            False,
+                            ExecutionStage.SENDING,
+                            "message_not_entered",
+                            "消息未进入输入框，已中止发送",
+                            retryable=True,
+                            discovered_names=tuple(discovered),
+                            delivery_state=DeliveryState.NOT_SENT,
+                        )
                     # 不可逆点：Enter 一经按下，页面可能已经在发送，即便随后
                     # 报错也无法证明没发出去。先置位，再触发。
                     send_attempted = True

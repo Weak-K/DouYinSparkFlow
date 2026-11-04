@@ -434,6 +434,10 @@ class _FakeEditor:
     async def type(self, value):
         self.typed.append(value)
 
+    async def inner_text(self):
+        # 默认模拟「输入真的进了编辑器」，与真实 Draft.js 行为一致。
+        return "\n".join(self.typed)
+
     async def press(self, key):
         self.pressed.append(key)
 
@@ -690,6 +694,51 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         # 已按过 Enter 但没拿到回执：不许当成「没发出去」重来一遍。
         self.assertEqual(DeliveryState.UNCERTAIN, result.delivery_state)
         self.assertFalse(result.safe_to_retry)
+
+    async def test_executor_aborts_before_enter_when_editor_swallowed_the_text(self):
+        """页面吞掉输入时绝不能按 Enter：那样只会发空消息或空转。"""
+
+        class _SilentEditor(_FakeEditor):
+            async def inner_text(self):
+                return ""
+
+        page = _FakeSendingPage()
+        page.editor = _SilentEditor()
+        browser = _FakeBrowser()
+
+        async def new_page():
+            return page
+
+        browser.context.new_page = new_page
+        async_api = ModuleType("playwright.async_api")
+        async_api.async_playwright = lambda: _FakePlaywrightManager(browser)
+        playwright = ModuleType("playwright")
+        playwright.async_api = async_api
+        core_tasks = ModuleType("core.tasks")
+        core_tasks.confirm_message_sent = lambda *_args, **_kwargs: None
+
+        async def select_target(*_args, **_kwargs):
+            return "目标"
+
+        raw = b'[{"name":"sid","value":"swallowed-marker","domain":".douyin.com","path":"/"}]'
+        with patch.dict(
+            "sys.modules",
+            {
+                "playwright": playwright,
+                "playwright.async_api": async_api,
+                "core.tasks": core_tasks,
+            },
+        ), patch("spark_console.executor.select_web_chat_target", select_target):
+            result = await DouyinExecutor().execute(raw, "目标", "消息")
+
+        # 一个字都没进编辑器，Enter 就绝不能按下。
+        self.assertEqual([], page.editor.pressed)
+        self.assertFalse(result.success)
+        self.assertEqual("message_not_entered", result.error_code)
+        self.assertEqual("sending", result.stage)
+        self.assertEqual(DeliveryState.NOT_SENT, result.delivery_state)
+        self.assertTrue(result.safe_to_retry)
+        self.assertTrue(result.retryable)
 
     async def test_executor_treats_error_raised_by_enter_as_uncertain(self):
         """Enter 按下后才报错时，不能当成「没发出去」——重试会造成重复消息。"""
