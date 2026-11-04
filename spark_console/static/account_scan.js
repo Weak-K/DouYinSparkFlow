@@ -175,7 +175,7 @@
       const state = await readJson(response);
       if (closeRequested || cancelPending) return;
       if (!renderState(state)) {
-        timer = window.setTimeout(pollScan, 2000);
+        timer = window.setTimeout(pollScan, 1000);
       }
     } catch (error) {
       setBusy(false);
@@ -230,7 +230,7 @@
         return;
       }
       if (!terminal) {
-        timer = window.setTimeout(pollScan, 2000);
+        timer = window.setTimeout(pollScan, 1000);
       }
     } catch (error) {
       startPending = false;

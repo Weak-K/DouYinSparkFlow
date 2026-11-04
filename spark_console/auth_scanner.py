@@ -35,6 +35,7 @@ SELF_PROFILE_URL = (
 )
 CREATOR_USER_INFO_URL = "https://creator.douyin.com/web/api/media/user/info/"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
 
 LOGIN_PANEL_SELECTORS = (
     '[class*="login"]',
@@ -260,6 +261,10 @@ class DouyinQrScanner:
         while loop.time() < deadline:
             if cancelled():
                 raise ScanCancelled()
+            # 登录弹窗可能已经自动打开：先看二维码是否已经可见，
+            # 能省掉等待“登录/扫码登录”按钮再点击的一到数秒。
+            if await self._qr_locator(page) is not None:
+                return
             for label in ("登录", "扫码登录"):
                 for button in await page.get_by_text(label, exact=True).all():
                     if not await button.is_visible():
@@ -267,7 +272,35 @@ class DouyinQrScanner:
                     await button.click(timeout=10_000)
                     return
             await asyncio.sleep(self.poll_interval_seconds)
-        raise QrLoadFailed()
+        # 找不到按钮时不再直接判失败：交给 _find_qr 继续等二维码，
+        # 兼容弹窗自动打开、按钮文案变化的页面版本。
+        return
+
+    async def _qr_locator(self, page):
+        """只按登录面板和二维码选择器快速定位，避免每轮遍历整页元素。"""
+
+        for panel_selector in LOGIN_PANEL_SELECTORS:
+            panel = page.locator(panel_selector).first
+            try:
+                if not await panel.is_visible():
+                    continue
+            except Exception:
+                continue
+            for qr_selector in QR_SELECTORS:
+                qr = panel.locator(qr_selector).first
+                try:
+                    if await qr.is_visible():
+                        return qr
+                except Exception:
+                    continue
+        for qr_selector in QR_SELECTORS:
+            qr = page.locator(qr_selector).first
+            try:
+                if await qr.is_visible():
+                    return qr
+            except Exception:
+                continue
+        return None
 
     async def _find_qr(self, page, cancelled):
         loop = asyncio.get_running_loop()
@@ -276,14 +309,9 @@ class DouyinQrScanner:
             if cancelled():
                 raise ScanCancelled()
             try:
-                for panel_selector in LOGIN_PANEL_SELECTORS:
-                    panel = page.locator(panel_selector).first
-                    if not await panel.is_visible():
-                        continue
-                    for qr_selector in QR_SELECTORS:
-                        qr = panel.locator(qr_selector).first
-                        if await qr.is_visible():
-                            return qr
+                qr = await self._qr_locator(page)
+                if qr is not None:
+                    return qr
                 for qr in await page.locator("img, canvas").all():
                     if not await qr.is_visible():
                         continue
@@ -519,10 +547,14 @@ class DouyinQrScanner:
                             logger.warning(
                                 "auth scan verification submit failed, value typed but button not found"
                             )
-            png = await page.screenshot(type="png")
-            if isinstance(png, bytes) and png.startswith(PNG_SIGNATURE):
-                await _invoke(on_view, png)
-            await asyncio.sleep(max(0.75, self.poll_interval_seconds))
+            # 实时视图改 JPEG 并降到 1.5 秒一帧：整页 PNG 每 0.75 秒编码一次
+            # 会长期占满一个 CPU 核心，而前端本身也是按秒级轮询取图。
+            frame = await page.screenshot(type="jpeg", quality=60)
+            if isinstance(frame, bytes) and frame.startswith(
+                (JPEG_SIGNATURE, PNG_SIGNATURE)
+            ):
+                await _invoke(on_view, frame)
+            await asyncio.sleep(max(1.5, self.poll_interval_seconds))
 
     @staticmethod
     async def _select_sms_verification(page) -> bool:

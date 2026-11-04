@@ -178,7 +178,7 @@ async def run_loop() -> None:
         await worker.run_once(stopping)
         try:
             await asyncio.wait_for(
-                stopping.wait(), timeout=settings.worker_poll_seconds
+                stopping.wait(), timeout=settings.auth_poll_seconds
             )
         except TimeoutError:
             continue

@@ -20,6 +20,8 @@ from spark_console.services import Conflict, NotFound, ValidationError
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
+IMAGE_SIGNATURES = (PNG_SIGNATURE, JPEG_SIGNATURE)
 MAX_QR_PNG_BYTES = 1024 * 1024
 
 ACTIVE_STATUSES = frozenset(
@@ -174,12 +176,7 @@ class ScanSessionService:
         return self._reload(scan.id)
 
     def publish_qr(self, scan_id: str, png: bytes) -> DouyinLoginSession:
-        if (
-            not isinstance(png, bytes)
-            or not png.startswith(PNG_SIGNATURE)
-            or len(png) > MAX_QR_PNG_BYTES
-        ):
-            raise ValidationError("invalid_qr_png")
+        self._validate_image(png)
         scan = self._get(scan_id)
         return self._cas_transition(
             scan,
@@ -188,7 +185,7 @@ class ScanSessionService:
         )
 
     def publish_view(self, scan_id: str, png: bytes) -> DouyinLoginSession:
-        self._validate_png(png)
+        self._validate_image(png)
         scan = self._get(scan_id)
         current = self._now()
         result = self.session.execute(
@@ -425,10 +422,10 @@ class ScanSessionService:
         return scan
 
     @staticmethod
-    def _validate_png(png: bytes) -> None:
+    def _validate_image(png: bytes) -> None:
         if (
             not isinstance(png, bytes)
-            or not png.startswith(PNG_SIGNATURE)
+            or not any(png.startswith(signature) for signature in IMAGE_SIGNATURES)
             or len(png) > MAX_QR_PNG_BYTES
         ):
             raise ValidationError("invalid_qr_png")

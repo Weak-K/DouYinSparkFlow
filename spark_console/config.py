@@ -15,6 +15,7 @@ class Settings:
     web_bind: str = "127.0.0.1"
     web_port: int = 8899
     worker_poll_seconds: int = 10
+    auth_poll_seconds: int = 1
     clock_offset_limit_seconds: int = 5
     secure_cookies: bool = True
 
@@ -44,6 +45,7 @@ class Settings:
             web_bind=environ.get("SPARK_WEB_BIND", "127.0.0.1"),
             web_port=int(environ.get("SPARK_WEB_PORT", "8899")),
             worker_poll_seconds=int(environ.get("SPARK_WORKER_POLL_SECONDS", "10")),
+            auth_poll_seconds=int(environ.get("SPARK_AUTH_POLL_SECONDS", "1")),
             clock_offset_limit_seconds=int(
                 environ.get("SPARK_CLOCK_OFFSET_LIMIT_SECONDS", "5")
             ),

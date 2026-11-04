@@ -13,7 +13,7 @@ from spark_console.models import utc_now
 from spark_console.services import Conflict, NotFound, ValidationError
 from spark_console.services.accounts import AccountService
 from spark_console.services.audits import AuditService
-from spark_console.services.scan_sessions import ScanSessionService
+from spark_console.services.scan_sessions import JPEG_SIGNATURE, ScanSessionService
 from spark_console.web.auth import WebAuth
 
 
@@ -119,7 +119,10 @@ def build_account_scan_router(
             png = scan.qr_png
             if png is None:
                 return _error(404, "qr_unavailable", "二维码尚未就绪")
-        return Response(content=png, media_type="image/png", headers=NO_STORE)
+            media_type = (
+                "image/jpeg" if png.startswith(JPEG_SIGNATURE) else "image/png"
+            )
+        return Response(content=png, media_type=media_type, headers=NO_STORE)
 
     @router.post("/accounts/scan/{scan_id}/cancel")
     def cancel_scan(
