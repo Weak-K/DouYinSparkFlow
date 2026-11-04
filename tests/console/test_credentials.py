@@ -7,7 +7,7 @@ from types import ModuleType
 from unittest.mock import AsyncMock, patch
 
 from spark_console.credentials import CredentialError, CredentialPayload
-from spark_console.executor import DouyinExecutor
+from spark_console.executor import DeliveryState, DouyinExecutor
 
 
 _PLAYWRIGHT_INVALID_LEGACY_LOCATIONS = {
@@ -687,6 +687,54 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("submitted", result.stage)
         self.assertEqual("delivery_confirmation_unavailable", result.error_code)
         self.assertFalse(result.retryable)
+        # 已按过 Enter 但没拿到回执：不许当成「没发出去」重来一遍。
+        self.assertEqual(DeliveryState.UNCERTAIN, result.delivery_state)
+        self.assertFalse(result.safe_to_retry)
+
+    async def test_executor_treats_error_raised_by_enter_as_uncertain(self):
+        """Enter 按下后才报错时，不能当成「没发出去」——重试会造成重复消息。"""
+
+        class _FailingEditor(_FakeEditor):
+            async def press(self, key):
+                self.pressed.append(key)
+                if key == "Enter":
+                    raise RuntimeError("page died while pressing enter")
+
+        page = _FakeSendingPage()
+        page.editor = _FailingEditor()
+        browser = _FakeBrowser()
+
+        async def new_page():
+            return page
+
+        browser.context.new_page = new_page
+        async_api = ModuleType("playwright.async_api")
+        async_api.async_playwright = lambda: _FakePlaywrightManager(browser)
+        playwright = ModuleType("playwright")
+        playwright.async_api = async_api
+        core_tasks = ModuleType("core.tasks")
+        core_tasks.confirm_message_sent = lambda *_args, **_kwargs: None
+
+        async def select_target(*_args, **_kwargs):
+            return "目标"
+
+        raw = b'[{"name":"sid","value":"enter-crash-marker","domain":".douyin.com","path":"/"}]'
+        with patch.dict(
+            "sys.modules",
+            {
+                "playwright": playwright,
+                "playwright.async_api": async_api,
+                "core.tasks": core_tasks,
+            },
+        ), patch("spark_console.executor.select_web_chat_target", select_target):
+            result = await DouyinExecutor().execute(raw, "目标", "消息")
+
+        self.assertEqual(["Enter"], page.editor.pressed)
+        self.assertFalse(result.success)
+        self.assertEqual("automation_failed", result.error_code)
+        self.assertFalse(result.retryable)
+        self.assertEqual(DeliveryState.UNCERTAIN, result.delivery_state)
+        self.assertFalse(result.safe_to_retry)
 
     async def test_executor_reports_conversation_that_did_not_open(self):
         page = _FakeConversationNotOpenedPage()
@@ -778,6 +826,10 @@ class ExecutorCredentialTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual("target_ambiguous", result.error_code)
         self.assertFalse(result.retryable)
+        # 技术上确定没发，所以 safe_to_retry 为真；但业务上重试仍是歧义，
+        # 所以 retryable 为假。两个字段语义不同，不能互相推导。
+        self.assertEqual(DeliveryState.NOT_SENT, result.delivery_state)
+        self.assertTrue(result.safe_to_retry)
         self.assertEqual([], page.editor.typed)
         self.assertEqual([], page.editor.pressed)
 

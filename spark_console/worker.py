@@ -247,6 +247,15 @@ class Worker:
                     notification,
                 )
             else:
+                # success 表达业务口径，delivery_state 表达「消息有没有可能已经发出去」。
+                # 两者必须分开看：UNCERTAIN 即使记成功也不代表确认送达。
+                if result.delivery_state is not None:
+                    logger.info(
+                        "task_run delivery_state=%s stage=%s success=%s",
+                        result.delivery_state,
+                        result.stage,
+                        result.success,
+                    )
                 if result.success:
                     db.execute(
                         update(DouyinAccount)
