@@ -47,6 +47,9 @@ class _Locator:
     def locator(self, selector):
         return self.children.get(selector, _Locator())
 
+    async def count(self):
+        return 1 if self.visible else 0
+
     async def is_visible(self, **_kwargs):
         if self.visible_sequence:
             self.visible = self.visible_sequence.pop(0)
@@ -121,6 +124,7 @@ class _Page:
         )
         self.sms_button = _Locator(visible=mode == "sms_verification")
         self.verify_button = _Locator(visible=mode == "sms_verification")
+        self.verify_input = _Locator(visible=mode == "sms_verification")
         self.viewport_size = {"width": 1280, "height": 720}
         self.keyboard = _Keyboard()
 
@@ -148,6 +152,8 @@ class _Page:
             return self.semantic_candidates
         if selector == LOGIN_PANEL_SELECTORS[0]:
             return self.panel
+        if selector == 'input[placeholder*="验证码"]':
+            return self.verify_input
         if selector == DISPLAY_NAME_SELECTOR:
             return _Locator(visible=self.profile_visible, text=" 测试昵称 " if self.profile_visible else "")
         if selector == UNIQUE_ID_SELECTOR:
@@ -584,6 +590,8 @@ class DouyinQrScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["123456"], context.page.keyboard.values)
         sleep.assert_awaited_once_with(2)
         self.assertTrue(context.page.verify_button.clicked)
+        # 敲验证码前必须先聚焦输入框，避免字符落空。
+        self.assertTrue(context.page.verify_input.clicked)
 
     async def test_cloud_browser_prefers_sms_verification_when_option_appears(self):
         scanner, _browser, context = self._scanner(mode="sms_verification")

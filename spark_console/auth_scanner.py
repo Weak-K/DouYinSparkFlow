@@ -512,7 +512,13 @@ class DouyinQrScanner:
                 elif isinstance(action, dict) and action.get("kind") == "text":
                     value = str(action.get("text", ""))
                     if value.isdigit() and 4 <= len(value) <= 8:
-                        await self._type_and_submit_verification_code(page, value)
+                        submitted = await self._type_and_submit_verification_code(
+                            page, value
+                        )
+                        if not submitted:
+                            logger.warning(
+                                "auth scan verification submit failed, value typed but button not found"
+                            )
             png = await page.screenshot(type="png")
             if isinstance(png, bytes) and png.startswith(PNG_SIGNATURE):
                 await _invoke(on_view, png)
@@ -533,13 +539,36 @@ class DouyinQrScanner:
 
     @staticmethod
     async def _type_and_submit_verification_code(page, value: str) -> bool:
+        # 先定位短信验证码输入框并聚焦。此前直接 keyboard.type，焦点若不在
+        # 输入框上，字符会落空（前端甚至要求用户手动点一下云端输入框）。
+        # 优先 contenteditable / 输入框，拿到就点一下再敲。
+        focused = False
+        for selector in (
+            'input[placeholder*="验证码"]',
+            'input[type="text"]',
+            '[contenteditable="true"]',
+        ):
+            try:
+                box = page.locator(selector).first
+                if await box.count() > 0 and await box.is_visible():
+                    await box.click(timeout=10_000)
+                    focused = True
+                    break
+            except Exception:
+                continue
+        if not focused:
+            # 拿不到明确的输入框就退回旧行为，不阻断（用户仍可手动点）。
+            pass
         await page.keyboard.type(value)
         await asyncio.sleep(2)
+        # 提交按钮文案不固定（“验证 / 立即验证 / 确认”），先精确匹配“验证”，
+        # 找不到再放宽为包含“验证”的可见按钮，最后才放弃。
         try:
-            for button in await page.get_by_text("验证", exact=True).all():
-                if await button.is_visible():
-                    await button.click(timeout=10_000)
-                    return True
+            for exact in (True, False):
+                for button in await page.get_by_text("验证", exact=exact).all():
+                    if await button.is_visible():
+                        await button.click(timeout=10_000)
+                        return True
         except Exception:
             return False
         return False
