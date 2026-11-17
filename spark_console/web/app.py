@@ -31,7 +31,11 @@ from spark_console.models import (
 )
 from spark_console.rate_limit import FailedAttemptLimiter
 from spark_console.security import PasswordService, SessionService
-from spark_console.services.accounts import AccountService
+from spark_console.services.accounts import (
+    AccountService,
+    is_ignored_conversation_name,
+    normalized_conversation_name,
+)
 from spark_console.services.audits import AuditService
 from spark_console.services import Conflict, NotFound, ValidationError
 from spark_console.services.tasks import TaskService
@@ -214,6 +218,81 @@ def _snapshot_scanned_at(db, account_id: str) -> str | None:
     if newest.tzinfo is None:
         newest = newest.replace(tzinfo=timezone.utc)
     return newest.isoformat()
+
+
+def _name_group(name: str) -> int:
+    """没有左栏位置时的兜底分组：中文名 > 英文数字 > 符号装饰名。"""
+
+    first = name.lstrip()[:1]
+    if not first:
+        return 3
+    if "\u4e00" <= first <= "\u9fff":
+        return 0
+    if first.isascii() and first.isalnum():
+        return 1
+    return 2
+
+
+def _friend_catalog(db, account_id: str) -> list[dict[str, str]]:
+    """好友下拉的数据：只给绑定了 sec_uid 的单聊好友，按最近会话顺序排。
+
+    左栏里没有身份信息的会话名（群聊、折叠的群聊 / 互动消息 / 陌生人消息、
+    纯数字 ID、同一人的 NBSP 变体）不再混进名单 —— 勾了会把消息发进群，
+    或建出一条不抗改名的任务。名单外的人仍可在前端输入昵称后按回车手加。
+    """
+
+    positions: dict[str, int] = {}
+    for name, position in db.execute(
+        select(
+            DouyinConversation.display_name,
+            DouyinConversation.list_position,
+        ).where(DouyinConversation.account_id == account_id)
+    ).all():
+        if position is None:
+            continue
+        key = normalized_conversation_name(name)
+        if key and (key not in positions or position < positions[key]):
+            positions[key] = position
+
+    contacts = db.scalars(
+        select(DouyinContactIdentity).where(
+            DouyinContactIdentity.account_id == account_id
+        )
+    ).all()
+    ranked = []
+    for contact in contacts:
+        # 一个好友可能有多个别名（备注 / 昵称 / 抖音号 / 短号），任何一个出现在
+        # 左栏都算「最近聊过」，取最靠前的位置。
+        values = (
+            contact.remark_name,
+            contact.nickname,
+            contact.unique_id,
+            contact.short_id,
+        )
+        name = next((value for value in values if value), None)
+        if not name or is_ignored_conversation_name(name):
+            continue
+        matched = [
+            positions[key]
+            for key in (normalized_conversation_name(value) for value in values if value)
+            if key in positions
+        ]
+        ranked.append(
+            {
+                "name": name,
+                "sec_uid": contact.sec_uid,
+                "_position": min(matched) if matched else None,
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            item["_position"] is None,
+            item["_position"] if item["_position"] is not None else 0,
+            _name_group(item["name"]),
+            item["name"],
+        )
+    )
+    return [{"name": item["name"], "sec_uid": item["sec_uid"]} for item in ranked]
 
 
 def create_app(settings: Settings, engine: Engine) -> FastAPI:
@@ -551,49 +630,9 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
     def account_conversations(request: Request, account_id: str):
         with session_scope(engine) as db:
             user, _record = auth.current(request, db)
-            service = AccountService(db, cipher, AuditService(db))
-            service.get_owned(user.id, account_id)
-            conversation_names = db.scalars(
-                select(DouyinConversation.display_name)
-                .where(DouyinConversation.account_id == account_id)
-                .order_by(DouyinConversation.display_name)
-            ).all()
-            contacts = db.scalars(
-                select(DouyinContactIdentity)
-                .where(DouyinContactIdentity.account_id == account_id)
-            ).all()
-            aliases = {
-                value
-                for contact in contacts
-                for value in (
-                    contact.remark_name,
-                    contact.nickname,
-                    contact.unique_id,
-                    contact.short_id,
-                )
-                if value
-            }
-            items = [
-                {
-                    "name": contact.remark_name
-                    or contact.nickname
-                    or contact.unique_id
-                    or contact.short_id,
-                    "sec_uid": contact.sec_uid,
-                }
-                for contact in contacts
-                if contact.remark_name
-                or contact.nickname
-                or contact.unique_id
-                or contact.short_id
-            ]
-            items.extend(
-                {"name": name, "sec_uid": None}
-                for name in conversation_names
-                if name not in aliases
-            )
+            AccountService(db, cipher, AuditService(db)).get_owned(user.id, account_id)
             return {
-                "items": sorted(items, key=lambda item: item["name"]),
+                "items": _friend_catalog(db, account_id),
                 "scanned_at": _snapshot_scanned_at(db, account_id),
             }
 
@@ -847,26 +886,7 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
             account = db.get(DouyinAccount, account_id)
             if account is None:
                 raise HTTPException(404)
-            contacts = db.scalars(
-                select(DouyinContactIdentity).where(
-                    DouyinContactIdentity.account_id == account_id
-                )
-            ).all()
-            items = [
-                {
-                    "name": contact.remark_name
-                    or contact.nickname
-                    or contact.unique_id
-                    or contact.short_id,
-                    "sec_uid": contact.sec_uid,
-                }
-                for contact in contacts
-                if contact.remark_name
-                or contact.nickname
-                or contact.unique_id
-                or contact.short_id
-            ]
-            return {"items": sorted(items, key=lambda item: item["name"])}
+            return {"items": _friend_catalog(db, account_id)}
 
     @app.get("/admin/tasks/{task_id}/edit")
     def admin_edit_task_page(request: Request, task_id: str):

@@ -15,6 +15,7 @@ from spark_console.models import (
     DouyinAccount,
     DouyinAccountIdentity,
     DouyinContactIdentity,
+    DouyinConversation,
     SparkTask,
     SparkTaskTargetIdentity,
     User,
@@ -179,6 +180,45 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("新的昵称", contact.nickname)
         self.assertEqual("我的备注", contact.remark_name)
         self.assertEqual("stable-user-id", binding.sec_uid)
+
+    def test_discovery_keeps_left_panel_order_and_skips_aggregate_entries(self):
+        """会话快照必须记住左栏顺序（最近聊过 = 0），聚合入口不写库。"""
+
+        written = self.accounts.record_discovery(
+            self.account.id,
+            (
+                "最近的人",
+                "互动消息 12",
+                "折叠的群聊",
+                "陌生人消息（3）",
+                "3218993197904039",
+                "我的备注",
+            ),
+        )
+        self.session.flush()
+        self.assertEqual(3, written)
+
+        def positions():
+            return {
+                name: position
+                for name, position in self.session.execute(
+                    select(
+                        DouyinConversation.display_name,
+                        DouyinConversation.list_position,
+                    ).where(DouyinConversation.account_id == self.account.id)
+                ).all()
+            }
+
+        self.assertEqual(
+            {"最近的人": 0, "3218993197904039": 4, "我的备注": 5}, positions()
+        )
+
+        # 下一次快照刷新已有行的位置；没再出现的行只增不删，保留旧位置。
+        self.accounts.record_discovery(self.account.id, ("我的备注", "最近的人"))
+        self.session.flush()
+        self.assertEqual(
+            {"最近的人": 1, "3218993197904039": 4, "我的备注": 0}, positions()
+        )
 
     def test_task_rejects_contact_identity_owned_by_another_account(self):
         other_account = self.accounts.create(

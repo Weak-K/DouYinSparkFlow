@@ -62,6 +62,9 @@ class DouyinConversation(Base):
     discovered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
+    # 最近一次快照里这行在左栏的位置：抖音左栏本身按最近消息排，0 就是最近聊过的。
+    # 没出现在当次快照里的会话保留旧值；从来没有位置的（例如扫码前的老数据）为 NULL。
+    list_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class DouyinContactIdentity(Base):

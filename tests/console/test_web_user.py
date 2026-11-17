@@ -339,14 +339,58 @@ class UserWebTests(unittest.TestCase):
             account_id = account.id
             session.add_all(
                 [
-                    DouyinConversation(account_id=account_id, display_name="wzlovegsy"),
-                    DouyinConversation(account_id=account_id, display_name="gsy"),
+                    # 左栏顺序：越靠前越是最近聊过的会话。
+                    DouyinConversation(
+                        account_id=account_id, display_name="最近的人", list_position=0
+                    ),
+                    DouyinConversation(
+                        account_id=account_id, display_name="wzlovegsy", list_position=1
+                    ),
+                    DouyinConversation(
+                        account_id=account_id, display_name="gsy", list_position=2
+                    ),
+                    DouyinConversation(
+                        account_id=account_id, display_name="折叠的群聊", list_position=3
+                    ),
+                    DouyinConversation(
+                        account_id=account_id, display_name="互动消息 12", list_position=4
+                    ),
+                    DouyinConversation(
+                        account_id=account_id,
+                        display_name="陌生人消息（3）",
+                        list_position=5,
+                    ),
+                    DouyinConversation(
+                        account_id=account_id,
+                        display_name="3218993197904039",
+                        list_position=6,
+                    ),
+                    # 同一人的 NBSP 变体也必须能关联上。
+                    DouyinConversation(
+                        account_id=account_id,
+                        display_name="punk\xa0LeeLii",
+                        list_position=7,
+                    ),
                     DouyinContactIdentity(
                         account_id=account_id,
                         sec_uid="stable-user-id",
                         unique_id="wzlovegsy",
                         nickname="新的昵称",
                         remark_name="我的备注",
+                    ),
+                    DouyinContactIdentity(
+                        account_id=account_id, sec_uid="recent-uid", nickname="最近的人"
+                    ),
+                    DouyinContactIdentity(
+                        account_id=account_id, sec_uid="old-uid", nickname="很久没聊"
+                    ),
+                    DouyinContactIdentity(
+                        account_id=account_id,
+                        sec_uid="prefix-uid",
+                        nickname="互动消息播报员",
+                    ),
+                    DouyinContactIdentity(
+                        account_id=account_id, sec_uid="nbsp-uid", nickname="punk LeeLii"
                     ),
                 ]
             )
@@ -357,11 +401,28 @@ class UserWebTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(
             [
-                {"name": "gsy", "sec_uid": None},
+                {"name": "最近的人", "sec_uid": "recent-uid"},
                 {"name": "我的备注", "sec_uid": "stable-user-id"},
+                {"name": "punk LeeLii", "sec_uid": "nbsp-uid"},
+                {"name": "互动消息播报员", "sec_uid": "prefix-uid"},
+                {"name": "很久没聊", "sec_uid": "old-uid"},
             ],
             body["items"],
         )
+        # 群聊、折叠入口、纯数字 ID 等没有 sec_uid 的会话不再混进好友名单。
+        names = {item["name"] for item in body["items"]}
+        self.assertFalse(
+            names
+            & {
+                "gsy",
+                "折叠的群聊",
+                "互动消息 12",
+                "陌生人消息（3）",
+                "3218993197904039",
+            }
+        )
+        # 「互动消息播报员」是真人昵称，不能被聚合入口的过滤规则误伤。
+        self.assertIn("互动消息播报员", names)
         # 好友名单来自快照，前端要能显示它是何时更新的。
         self.assertTrue(body["scanned_at"])
         self.assertIn('id="task-target-list"', tasks_page.text)

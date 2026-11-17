@@ -119,7 +119,7 @@
       }));
       const scanned = formatScannedAt(body.scanned_at);
       status.textContent = catalog.length
-        ? `已保存 ${catalog.length} 位好友${scanned}，可一次勾选多位；名单外的昵称直接输入后按回车添加`
+        ? `已保存 ${catalog.length} 位好友${scanned}，按最近聊天顺序排列；群聊与未识别会话不显示，名单外的昵称直接输入后按回车添加`
         : "尚未保存好友名单（下次执行任务时会自动读取），可直接输入昵称后按回车添加";
     } catch (error) {
       status.textContent = error.message || "好友名单读取失败，可直接输入昵称后按回车添加";

@@ -42,7 +42,7 @@
       }
       const scanned = formatScannedAt(body.scanned_at);
       status.textContent = body.items?.length
-        ? `已保存 ${body.items.length} 个好友可选${scanned}；每次执行任务时会自动补全名单，更多好友会陆续出现`
+        ? `已保存 ${body.items.length} 个好友可选${scanned}，按最近聊天顺序排列；群聊与未识别会话不显示`
         : "尚未保存好友名单（下次执行任务时会自动读取），也可直接手动输入准确昵称";
     } catch (error) {
       status.textContent = error.message || "好友名单读取失败，仍可手动输入";

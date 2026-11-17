@@ -12,6 +12,8 @@ from spark_console.models import Base, WorkerLock
 # create_all 只会新建缺失的表，不会给既有表补列，因此线上老库要在这里显式补齐新增字段。
 _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "users": (("email", "VARCHAR(254)"),),
+    # 好友名单要按左栏「最近会话」顺序排，老库里这列不存在。
+    "douyin_conversations": (("list_position", "INTEGER"),),
 }
 
 _ADDITIVE_INDEXES: tuple[tuple[str, str, str], ...] = (

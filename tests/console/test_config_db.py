@@ -11,6 +11,7 @@ from spark_console.db import create_engine_for, create_schema, session_scope
 from spark_console.models import (
     DouyinAccount,
     DouyinAccountIdentity,
+    DouyinConversation,
     DouyinLoginSession,
     InviteCode,
     ScanStatus,
@@ -32,6 +33,14 @@ LEGACY_USERS_TABLE = (
     "locked_until DATETIME, "
     "created_at DATETIME NOT NULL, "
     "updated_at DATETIME NOT NULL)"
+)
+
+LEGACY_CONVERSATIONS_TABLE = (
+    "CREATE TABLE douyin_conversations ("
+    "account_id VARCHAR(36) NOT NULL, "
+    "display_name VARCHAR(256) NOT NULL, "
+    "discovered_at DATETIME NOT NULL, "
+    "PRIMARY KEY (account_id, display_name))"
 )
 
 
@@ -120,6 +129,35 @@ class SchemaUpgradeTests(unittest.TestCase):
             self.assertEqual(
                 "legacy@example.com",
                 session.scalar(select(User.email).where(User.username == "legacy")),
+            )
+
+    def test_legacy_database_gains_conversation_list_position(self):
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(LEGACY_CONVERSATIONS_TABLE)
+
+        create_schema(self.engine)
+
+        columns = {
+            column["name"]
+            for column in inspect(self.engine).get_columns("douyin_conversations")
+        }
+        self.assertIn("list_position", columns)
+        with session_scope(self.engine) as session:
+            session.add(
+                DouyinConversation(
+                    account_id="legacy-account",
+                    display_name="最近的人",
+                    list_position=0,
+                )
+            )
+        with session_scope(self.engine) as session:
+            self.assertEqual(
+                0,
+                session.scalar(
+                    select(DouyinConversation.list_position).where(
+                        DouyinConversation.display_name == "最近的人"
+                    )
+                ),
             )
 
     def test_repeated_schema_creation_stays_idempotent(self):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -17,6 +19,34 @@ from spark_console.models import (
 )
 from spark_console.services import NotFound, ValidationError
 from spark_console.services.audits import AuditService
+
+
+# 抖音把「折叠的群聊 / 互动消息 / 陌生人消息」折成一个聚合入口，点进去是列表而不是
+# 一个人；它们既不是好友，也不能用来发火花。标题常带未读数（"互动消息 12"）或括号数字。
+_IGNORED_CONVERSATION_PREFIXES = ("折叠的群聊", "互动消息", "陌生人消息")
+_AGGREGATE_BADGE = re.compile(r"[\s\u00a0]*[（(]?\d+[)）]?\s*$")
+_ZERO_WIDTH = dict.fromkeys(
+    map(ord, "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff"), None
+)
+
+
+def is_ignored_conversation_name(name) -> bool:
+    """判断左栏标题是否是不能当好友选的聚合入口。"""
+
+    text = _AGGREGATE_BADGE.sub("", str(name or "").strip())
+    # 精确匹配，别把昵称恰好以「互动消息」开头的好友一起过滤掉。
+    return text in _IGNORED_CONVERSATION_PREFIXES
+
+
+def normalized_conversation_name(value) -> str:
+    """与 core.web_chat.normalize_target_name 同一套折叠规则（NFKC + 去零宽 + 空白折叠）。
+
+    独立实现是为了让 web 端读名单时不必 import 浏览器链路的模块；会话标题里
+    `\xa0` 与普通空格并存很常见（例如 `punk\xa0LeeLii`），不折叠就会排错/重复。
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or "")).translate(_ZERO_WIDTH)
+    return " ".join(text.split())
 
 
 class AccountService:
@@ -90,15 +120,22 @@ class AccountService:
             )
         )
         seen = set()
-        for display_name in conversation_names:
+        # conversation_names 的顺序就是抖音左栏的顺序（按最近消息排），直接当位置存下来。
+        # 被忽略的聚合入口不写库，但位置仍按原始序号算，别让后面的好友整体前移。
+        for position, display_name in enumerate(conversation_names):
             normalized_name = str(display_name).strip()
-            if not normalized_name or normalized_name in seen:
+            if (
+                not normalized_name
+                or normalized_name in seen
+                or is_ignored_conversation_name(normalized_name)
+            ):
                 continue
             seen.add(normalized_name)
             self.session.add(
                 DouyinConversation(
                     account_id=account.id,
                     display_name=normalized_name[:256],
+                    list_position=position,
                 )
             )
         for identity in contact_identities:
@@ -175,9 +212,9 @@ class AccountService:
                 )
             ).all()
         )
-        for display_name in conversation_names:
+        for position, display_name in enumerate(conversation_names):
             normalized_name = str(display_name).strip()[:256]
-            if not normalized_name:
+            if not normalized_name or is_ignored_conversation_name(normalized_name):
                 continue
             if normalized_name in known:
                 self.session.execute(
@@ -186,13 +223,15 @@ class AccountService:
                         DouyinConversation.account_id == account_id,
                         DouyinConversation.display_name == normalized_name,
                     )
-                    .values(discovered_at=now)
+                    .values(discovered_at=now, list_position=position)
                 )
             else:
                 known.add(normalized_name)
                 self.session.add(
                     DouyinConversation(
-                        account_id=account_id, display_name=normalized_name
+                        account_id=account_id,
+                        display_name=normalized_name,
+                        list_position=position,
                     )
                 )
             written += 1
