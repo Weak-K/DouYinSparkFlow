@@ -293,6 +293,8 @@ class Worker:
                         account_id,
                         result.discovered_names,
                         result.discovered_identities,
+                        # 没滚完整左栏的顺带快照不能改写最近会话顺序。
+                        conversation_order_is_complete=refresh_targets,
                     )
                 except Exception:
                     logger.warning("好友快照写回失败，已忽略以免影响本次执行结果")

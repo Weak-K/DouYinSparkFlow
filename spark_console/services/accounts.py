@@ -191,6 +191,8 @@ class AccountService:
         account_id: str,
         conversation_names=(),
         contact_identities=(),
+        *,
+        conversation_order_is_complete: bool = True,
     ) -> int:
         """把一次真实执行中看到的好友名单并回快照表（只增不删）。
 
@@ -198,6 +200,10 @@ class AccountService:
         首屏快照，之后永不更新——好友改名、新人加进来都看不见。这里做 upsert：
         新名字补进来，老名字只刷新 discovered_at，绝不删除（删了会连用户已绑定的
         选项一起丢）。
+
+        只有「完整滚完左栏」的快照才带顺序。日常任务没触发保鲜时 executor 只会
+        顺带记下首屏十来条 + 搜索结果，那份名单是残缺的，绝不能拿来改写位置，
+        否则会把最近会话顺序搅乱；此时只补名字，位置保持原值。
         """
 
         account = self.session.get(DouyinAccount, account_id)
@@ -217,13 +223,16 @@ class AccountService:
             if not normalized_name or is_ignored_conversation_name(normalized_name):
                 continue
             if normalized_name in known:
+                refreshed = {"discovered_at": now}
+                if conversation_order_is_complete:
+                    refreshed["list_position"] = position
                 self.session.execute(
                     update(DouyinConversation)
                     .where(
                         DouyinConversation.account_id == account_id,
                         DouyinConversation.display_name == normalized_name,
                     )
-                    .values(discovered_at=now, list_position=position)
+                    .values(**refreshed)
                 )
             else:
                 known.add(normalized_name)
@@ -231,7 +240,9 @@ class AccountService:
                     DouyinConversation(
                         account_id=account_id,
                         display_name=normalized_name,
-                        list_position=position,
+                        list_position=(
+                            position if conversation_order_is_complete else None
+                        ),
                     )
                 )
             written += 1

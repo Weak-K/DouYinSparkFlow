@@ -220,6 +220,23 @@ class ServiceTests(unittest.TestCase):
             {"最近的人": 1, "3218993197904039": 4, "我的备注": 0}, positions()
         )
 
+        # 日常任务没触发保鲜时只会带上残缺名单，可以补新名字，但不能改写位置。
+        self.accounts.record_discovery(
+            self.account.id,
+            ("最近的人", "刚搜到的人"),
+            conversation_order_is_complete=False,
+        )
+        self.session.flush()
+        self.assertEqual(
+            {
+                "最近的人": 1,
+                "3218993197904039": 4,
+                "我的备注": 0,
+                "刚搜到的人": None,
+            },
+            positions(),
+        )
+
     def test_task_rejects_contact_identity_owned_by_another_account(self):
         other_account = self.accounts.create(
             self.owner.id, "其他账号", b'[{"name":"sid","value":"other"}]'
