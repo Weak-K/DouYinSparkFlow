@@ -43,7 +43,7 @@ class SessionTests(unittest.TestCase):
         self.assertNotEqual(raw, record.token_hash)
         self.assertEqual(hashlib.sha256(raw.encode()).hexdigest(), record.token_hash)
         self.assertEqual(
-            datetime(2026, 8, 25, tzinfo=timezone.utc) + timedelta(hours=8),
+            datetime(2026, 8, 25, tzinfo=timezone.utc) + timedelta(hours=24),
             record.expires_at,
         )
         self.assertTrue(service.matches(raw, record))

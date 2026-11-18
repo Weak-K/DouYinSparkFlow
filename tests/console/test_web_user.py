@@ -20,6 +20,7 @@ from spark_console.models import (
     SparkTaskTargetIdentity,
     TaskRun,
     User,
+    WebSession,
 )
 from spark_console.security import PasswordService
 from spark_console.services.accounts import AccountService
@@ -75,6 +76,31 @@ class UserWebTests(unittest.TestCase):
         dashboard = self.client.get("/dashboard", follow_redirects=False)
         self.assertEqual(303, dashboard.status_code)
         self.assertEqual("/change-password", dashboard.headers["location"])
+
+    def test_login_session_and_cookie_both_last_24_hours(self):
+        response = self.login()
+
+        self.assertEqual(303, response.status_code)
+        cookie = self.client.cookies.get("spark_session")
+        self.assertTrue(cookie)
+        self.assertIn("Max-Age=86400", response.headers["set-cookie"])
+        self.assertIn("expires=", response.headers["set-cookie"].lower())
+        with session_scope(self.engine) as session:
+            records = session.scalars(select(WebSession)).all()
+            self.assertEqual(1, len(records))
+            expires_at = records[0].expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            remaining = expires_at - datetime.now(timezone.utc)
+            self.assertAlmostEqual(24 * 3600, remaining.total_seconds(), delta=5)
+
+        # 重开 Web 进程、重新读取同一个持久化密钥后，原会话仍然有效。
+        self.client.close()
+        self.client = TestClient(
+            create_app(self.settings, self.engine), base_url="https://testserver"
+        )
+        self.client.cookies.set("spark_session", cookie)
+        self.assertEqual(200, self.client.get("/change-password").status_code)
 
     def test_post_without_csrf_is_rejected(self):
         self.login()

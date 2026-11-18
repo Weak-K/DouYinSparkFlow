@@ -30,7 +30,7 @@ from spark_console.models import (
     WorkerLock,
 )
 from spark_console.rate_limit import FailedAttemptLimiter
-from spark_console.security import PasswordService, SessionService
+from spark_console.security import PasswordService, SessionService, WEB_SESSION_LIFETIME
 from spark_console.services.accounts import (
     AccountService,
     is_ignored_conversation_name,
@@ -499,13 +499,17 @@ def create_app(settings: Settings, engine: Engine) -> FastAPI:
             db.add(record)
             destination = "/change-password" if user.must_change_password else "/dashboard"
         response = RedirectResponse(destination, status_code=303)
+        expires_at = record.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
         response.set_cookie(
             "spark_session",
             raw,
             httponly=True,
             secure=settings.secure_cookies,
             samesite="strict",
-            max_age=8 * 3600,
+            expires=expires_at,
+            max_age=int(WEB_SESSION_LIFETIME.total_seconds()),
         )
         return response
 

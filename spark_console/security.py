@@ -13,6 +13,7 @@ from spark_console.models import WebSession
 # 密码最短长度：内部小工具，按用户要求从 10/12 位放宽到 6 位
 # （不再强制字母 + 数字混合，纯数字也接受）。
 MIN_PASSWORD_LENGTH = 6
+WEB_SESSION_LIFETIME = timedelta(hours=24)
 
 
 class PasswordService:
@@ -34,7 +35,7 @@ class PasswordService:
 
 
 class SessionService:
-    def __init__(self, session_key: bytes, lifetime: timedelta = timedelta(hours=8)):
+    def __init__(self, session_key: bytes, lifetime: timedelta = WEB_SESSION_LIFETIME):
         if len(session_key) < 32:
             raise ValueError("session key must contain at least 32 bytes")
         self._key = session_key
